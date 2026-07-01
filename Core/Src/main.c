@@ -1,20 +1,20 @@
 /* USER CODE BEGIN Header */
 /**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
+ ******************************************************************************
+ * @file           : main.c
+ * @brief          : Main program body
+ ******************************************************************************
+ * @attention
+ *
+ * Copyright (c) 2026 STMicroelectronics.
+ * All rights reserved.
+ *
+ * This software is licensed under terms that can be found in the LICENSE file
+ * in the root directory of this software component.
+ * If no LICENSE file comes with this software, it is provided AS-IS.
+ *
+ ******************************************************************************
+ */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
@@ -48,7 +48,9 @@ DMA_HandleTypeDef hdma_adc1;
 
 CAN_HandleTypeDef hcan;
 
+TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
+TIM_HandleTypeDef htim4;
 
 UART_HandleTypeDef huart1;
 
@@ -62,23 +64,23 @@ CAN_RxHeaderTypeDef RxHeader; //RX
 uint8_t RxData[8];            //RX
 
 /* Variáveis Globais ADC e Controlo */
-volatile uint16_t adc_dma_raw[2] = {0};
-volatile uint8_t  adc_dma_ready  = 0;
+volatile uint16_t adc_dma_raw[2] = { 0 };
+volatile uint8_t adc_dma_ready = 0;
 
-uint16_t voltage_buffer[BUFFER_SIZE] = {0};
+uint16_t voltage_buffer[BUFFER_SIZE] = { 0 };
 uint32_t voltage_sum = 0;
-uint8_t  voltage_idx = 0;
+uint8_t voltage_idx = 0;
 
-uint16_t current_buffer[BUFFER_SIZE] = {0};
+uint16_t current_buffer[BUFFER_SIZE] = { 0 };
 uint32_t current_sum = 0;
-uint8_t  current_idx = 0;
+uint8_t current_idx = 0;
 
 uint16_t raw_voltage = 0;
 uint16_t raw_current = 0;
 
 float voltage_v = 0.0f;   // PA1 em Volts  ex: 3.009
 float current_v = 0.0f;   // PA2 em Volts  ex: 3.530
-uint16_t current_frac= 0;
+uint16_t current_frac = 0;
 
 /* Contadores do Timer (Sincronização) */
 uint16_t adc_counter = 0;
@@ -96,6 +98,8 @@ static void MX_CAN_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_TIM4_Init(void);
 /* USER CODE BEGIN PFP */
 
 void StartADC1(void);
@@ -111,627 +115,706 @@ void HeartbeatTask(void);
 
 /* EUSART */
 int __io_putchar(int ch) {
-    HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
-    return ch;
+	HAL_UART_Transmit(&huart1, (uint8_t*) &ch, 1, HAL_MAX_DELAY);
+	return ch;
 }
 
-/* CAN RX */
-void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+void Radiator_SetPWM(uint8_t percentagem)   // 0..100
 {
-    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK)
-        return;
+	if (percentagem > 100)
+		percentagem = 100;
+	__HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, (uint32_t )percentagem * 10);
+}
 
-    /* Confere ID */
-    //if (RxHeader.StdId == 0x23 && RxHeader.IDE == CAN_ID_STD)
-     if (RxHeader.StdId == 0x23 )
-    {
-        if (RxData[5] == 0x00) // If ID = 23 and Data = 01, OFF
-        {
-        	HAL_GPIO_WritePin(GPIOB, Radiator_Pin, GPIO_PIN_SET); // Invert Logic 1 -> 0
-        	HAL_GPIO_WritePin(GPIOB, AMS_Pin, GPIO_PIN_SET);
-        	HAL_GPIO_WritePin(GPIOA, WaterPump_Pin, GPIO_PIN_SET);
+void WaterPump_SetPWM(uint8_t percentagem)  // 0..100
+{
+	if (percentagem > 100)
+		percentagem = 100;
+	__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, (uint32_t )percentagem * 10);
+}
 
-        	/* Debug EUSART */
-        	char *test_msg = "Radiator, AMS, WaterPump OFF\r\n";
-        	HAL_UART_Transmit(&huart1, (uint8_t*)test_msg, strlen(test_msg), 100);
-        }
-        else if (RxData[5] == 0x01) // If ID = 23 and Data = 00, ON
-        {
-        	HAL_GPIO_WritePin(GPIOB, Radiator_Pin, GPIO_PIN_RESET); // Invert Logic 0 -> 1
-			HAL_GPIO_WritePin(GPIOB, AMS_Pin, GPIO_PIN_RESET);
+
+/* CAN RX */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
+	if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK)
+		return;
+
+	/* Confere ID */
+	//if (RxHeader.StdId == 0x23 && RxHeader.IDE == CAN_ID_STD)
+	if (RxHeader.StdId == 0x23) {
+		if (RxData[5] == 0x00) // If ID = 23 and Data = 01, OFF
+				{
+			Radiator_SetPWM(0);
+			WaterPump_SetPWM(0);
+			HAL_GPIO_WritePin(GPIOA, WaterPump_Pin, GPIO_PIN_SET);
+
+			/* Debug EUSART */
+			char *test_msg = "Radiator, AMS, WaterPump OFF\r\n";
+			HAL_UART_Transmit(&huart1, (uint8_t*) test_msg, strlen(test_msg), 100);
+		} else if (RxData[5] == 0x01) // If ID = 23 and Data = 00, ON
+				{
+			Radiator_SetPWM(100);
+			WaterPump_SetPWM(100);
 			HAL_GPIO_WritePin(GPIOA, WaterPump_Pin, GPIO_PIN_RESET);
 
 			/* Debug EUSART */
 			char *test_msg = "Radiator, AMS, WaterPump ON\r\n";
-			HAL_UART_Transmit(&huart1, (uint8_t*)test_msg, strlen(test_msg), 100);
-        }
-    }
+			HAL_UART_Transmit(&huart1, (uint8_t*) test_msg, strlen(test_msg), 100);
+		}
+	}
 }
 
 /* Callback do Timer 3 para incrementar os contadores sem bloquear o código */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-    if (htim->Instance == TIM3) {
-        adc_counter++;
-        data_trigger++;
-        lv_counter++;
-        heartbeat_counter++;
-    }
+	if (htim->Instance == TIM3) {
+		adc_counter++;
+		data_trigger++;
+		lv_counter++;
+		heartbeat_counter++;
+	}
 }
 
 // Called automatically by HAL when DMA finishes transferring both channels
-void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
-{
-    if (hadc->Instance == ADC1)
-    {
-        adc_dma_ready = 1;   // Signal the main loop
-    }
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
+	if (hadc->Instance == ADC1) {
+		adc_dma_ready = 1;   // Signal the main loop
+	}
 }
 
 /* USER CODE END 0 */
 
 /**
-  * @brief  The application entry point.
-  * @retval int
-  */
-int main(void)
-{
+ * @brief  The application entry point.
+ * @retval int
+ */
+int main(void) {
 
-  /* USER CODE BEGIN 1 */
+	/* USER CODE BEGIN 1 */
 
-  /* USER CODE END 1 */
+	/* USER CODE END 1 */
 
-  /* MCU Configuration--------------------------------------------------------*/
+	/* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+	/* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+	HAL_Init();
 
-  /* USER CODE BEGIN Init */
+	/* USER CODE BEGIN Init */
 
-  /* USER CODE END Init */
+	/* USER CODE END Init */
 
-  /* Configure the system clock */
-  SystemClock_Config();
+	/* Configure the system clock */
+	SystemClock_Config();
 
-  /* USER CODE BEGIN SysInit */
+	/* USER CODE BEGIN SysInit */
 
-  /* USER CODE END SysInit */
+	/* USER CODE END SysInit */
 
-  /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_DMA_Init();
-  MX_CAN_Init();
-  MX_USART1_UART_Init();
-  MX_ADC1_Init();
-  MX_TIM3_Init();
-  /* USER CODE BEGIN 2 */
+	/* Initialize all configured peripherals */
+	MX_GPIO_Init();
+	MX_DMA_Init();
+	MX_CAN_Init();
+	MX_USART1_UART_Init();
+	MX_ADC1_Init();
+	MX_TIM3_Init();
+	MX_TIM2_Init();
+	MX_TIM4_Init();
+	/* USER CODE BEGIN 2 */
 
-  /* Iniciar Timer 3 com Interrupções para os Contadores */
-  if (HAL_TIM_Base_Start_IT(&htim3) != HAL_OK) {
-	Error_Handler();
-  }
+	/* Iniciar Timer 3 com Interrupções para os Contadores */
+	if (HAL_TIM_Base_Start_IT(&htim3) != HAL_OK) {
+		Error_Handler();
+	}
 
-  /* CAN */
-  HAL_CAN_Start(&hcan);
-  TxHeader.StdId = 0x123; // ID
-  TxHeader.ExtId = 0x00;
-  TxHeader.IDE = CAN_ID_STD;
-  TxHeader.RTR = CAN_RTR_DATA;
-  TxHeader.DLC = 3;
-  TxHeader.TransmitGlobalTime = DISABLE;
+	/* CAN */
+	HAL_CAN_Start(&hcan);
+	TxHeader.StdId = 0x123; // ID
+	TxHeader.ExtId = 0x00;
+	TxHeader.IDE = CAN_ID_STD;
+	TxHeader.RTR = CAN_RTR_DATA;
+	TxHeader.DLC = 3;
+	TxHeader.TransmitGlobalTime = DISABLE;
 
-  HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
+	HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
 
-  // EUSART Initial Message
-  char *test_msg = "USART OK\r\n";
-  HAL_UART_Transmit(&huart1, (uint8_t*)test_msg, strlen(test_msg), 100);
+	// EUSART Initial Message
+	char *test_msg = "USART OK\r\n";
+	HAL_UART_Transmit(&huart1, (uint8_t*) test_msg, strlen(test_msg), 100);
 
-  // Start IO OFF
-  HAL_GPIO_WritePin(GPIOB, Radiator_Pin, GPIO_PIN_SET); // Invert Logic 1 -> 0
-  HAL_GPIO_WritePin(GPIOB, AMS_Pin, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(GPIOA, WaterPump_Pin, GPIO_PIN_SET);
+	// Start IO OFF
+	HAL_GPIO_WritePin(GPIOB, Radiator_Pin, GPIO_PIN_SET); // Invert Logic 1 -> 0
+	HAL_GPIO_WritePin(GPIOB, AMS_Pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(GPIOA, WaterPump_Pin, GPIO_PIN_SET);
 
-  /* Inicializar o LED LV desligado */
-  HAL_GPIO_WritePin(Led_LV_GPIO_Port, Led_LV_Pin, GPIO_PIN_RESET);
+	/* Inicializar o LED LV desligado */
+	HAL_GPIO_WritePin(Led_LV_GPIO_Port, Led_LV_Pin, GPIO_PIN_RESET);
 
-  /* USER CODE END 2 */
+	/* USER CODE END 2 */
 
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  while (1)
-  {
+	/* Infinite loop */
+	/* USER CODE BEGIN WHILE */
+	while (1) {
 
-	//StartADC1();                  // Executa a leitura do ADC periodicamente
-	//VoltageMessure(raw_voltage);  // Avalia tensão e atualiza LED LV
-	//MeasureCurrent(raw_current);  // Calcula e processa a corrente
-	//SendData();                   // Envia dados UART e CAN
-	HeartbeatTask();              // Pisca o LED Heartbeat de forma não bloqueante
+		//StartADC1();                  // Executa a leitura do ADC periodicamente
+		//VoltageMessure(raw_voltage);  // Avalia tensão e atualiza LED LV
+		//MeasureCurrent(raw_current);  // Calcula e processa a corrente
+		//SendData();                   // Envia dados UART e CAN
+		HeartbeatTask();              // Pisca o LED Heartbeat de forma não bloqueante
 
-	HAL_GPIO_WritePin(GPIOB, Radiator_Pin, GPIO_PIN_RESET); // Invert Logic 0 -> 1
-	HAL_GPIO_WritePin(GPIOB, AMS_Pin, GPIO_PIN_RESET);
-	HAL_GPIO_WritePin(GPIOA, WaterPump_Pin, GPIO_PIN_RESET);
+		//HAL_GPIO_WritePin(GPIOB, Radiator_Pin, GPIO_PIN_RESET); // Invert Logic 0 -> 1
+		//HAL_GPIO_WritePin(GPIOB, AMS_Pin, GPIO_PIN_RESET);
+		//HAL_GPIO_WritePin(GPIOA, WaterPump_Pin, GPIO_PIN_RESET);
 
-    /* USER CODE END WHILE */
+		Radiator_SetPWM(100);
+		WaterPump_SetPWM(100);
 
-    /* USER CODE BEGIN 3 */
-  }
-  /* USER CODE END 3 */
+		/* USER CODE END WHILE */
+
+		/* USER CODE BEGIN 3 */
+	}
+	/* USER CODE END 3 */
 }
 
 /**
-  * @brief System Clock Configuration
-  * @retval None
-  */
-void SystemClock_Config(void)
-{
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+ * @brief System Clock Configuration
+ * @retval None
+ */
+void SystemClock_Config(void) {
+	RCC_OscInitTypeDef RCC_OscInitStruct = { 0 };
+	RCC_ClkInitTypeDef RCC_ClkInitStruct = { 0 };
+	RCC_PeriphCLKInitTypeDef PeriphClkInit = { 0 };
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
+	/** Initializes the RCC Oscillators according to the specified parameters
+	 * in the RCC_OscInitTypeDef structure.
+	 */
+	RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+	RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+	RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+	RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+	RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+	RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+	RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
+	if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+		Error_Handler();
+	}
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+	/** Initializes the CPU, AHB and APB buses clocks
+	 */
+	RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+	RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+	RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+	RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+	RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
-  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6;
-  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
-  {
-    Error_Handler();
-  }
+	if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) {
+		Error_Handler();
+	}
+	PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+	PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6;
+	if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK) {
+		Error_Handler();
+	}
 }
 
 /**
-  * @brief ADC1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_ADC1_Init(void)
-{
+ * @brief ADC1 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_ADC1_Init(void) {
 
-  /* USER CODE BEGIN ADC1_Init 0 */
+	/* USER CODE BEGIN ADC1_Init 0 */
 
-  /* USER CODE END ADC1_Init 0 */
+	/* USER CODE END ADC1_Init 0 */
 
-  ADC_ChannelConfTypeDef sConfig = {0};
+	ADC_ChannelConfTypeDef sConfig = { 0 };
 
-  /* USER CODE BEGIN ADC1_Init 1 */
+	/* USER CODE BEGIN ADC1_Init 1 */
 
-  /* USER CODE END ADC1_Init 1 */
+	/* USER CODE END ADC1_Init 1 */
 
-  /** Common config
-  */
-  hadc1.Instance = ADC1;
-  hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
-  hadc1.Init.ContinuousConvMode = DISABLE;
-  hadc1.Init.DiscontinuousConvMode = DISABLE;
-  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc1.Init.NbrOfConversion = 2;
-  if (HAL_ADC_Init(&hadc1) != HAL_OK)
-  {
-    Error_Handler();
-  }
+	/** Common config
+	 */
+	hadc1.Instance = ADC1;
+	hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
+	hadc1.Init.ContinuousConvMode = DISABLE;
+	hadc1.Init.DiscontinuousConvMode = DISABLE;
+	hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+	hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+	hadc1.Init.NbrOfConversion = 2;
+	if (HAL_ADC_Init(&hadc1) != HAL_OK) {
+		Error_Handler();
+	}
 
-  /** Configure Regular Channel
-  */
-  sConfig.Channel = ADC_CHANNEL_1;
-  sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
-  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
+	/** Configure Regular Channel
+	 */
+	sConfig.Channel = ADC_CHANNEL_1;
+	sConfig.Rank = ADC_REGULAR_RANK_1;
+	sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
+	if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+		Error_Handler();
+	}
 
-  /** Configure Regular Channel
-  */
-  sConfig.Channel = ADC_CHANNEL_2;
-  sConfig.Rank = ADC_REGULAR_RANK_2;
-  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN ADC1_Init 2 */
-  // Configurar o DMA handle manualmente (CubeMX não gerou isto)
-  hdma_adc1.Instance                 = DMA1_Channel1;  // ADC1 usa sempre DMA1 Ch1
-  hdma_adc1.Init.Direction           = DMA_PERIPH_TO_MEMORY;
-  hdma_adc1.Init.PeriphInc           = DMA_PINC_DISABLE;
-  hdma_adc1.Init.MemInc              = DMA_MINC_ENABLE;   // Avança no array destino
-  hdma_adc1.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;  // 16-bit ADC
-  hdma_adc1.Init.MemDataAlignment    = DMA_MDATAALIGN_HALFWORD;  // 16-bit destino
-  hdma_adc1.Init.Mode                = DMA_NORMAL;
-  hdma_adc1.Init.Priority            = DMA_PRIORITY_HIGH;
+	/** Configure Regular Channel
+	 */
+	sConfig.Channel = ADC_CHANNEL_2;
+	sConfig.Rank = ADC_REGULAR_RANK_2;
+	if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE BEGIN ADC1_Init 2 */
+	// Configurar o DMA handle manualmente (CubeMX não gerou isto)
+	hdma_adc1.Instance = DMA1_Channel1;  // ADC1 usa sempre DMA1 Ch1
+	hdma_adc1.Init.Direction = DMA_PERIPH_TO_MEMORY;
+	hdma_adc1.Init.PeriphInc = DMA_PINC_DISABLE;
+	hdma_adc1.Init.MemInc = DMA_MINC_ENABLE;   // Avança no array destino
+	hdma_adc1.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;  // 16-bit ADC
+	hdma_adc1.Init.MemDataAlignment = DMA_MDATAALIGN_HALFWORD;  // 16-bit destino
+	hdma_adc1.Init.Mode = DMA_NORMAL;
+	hdma_adc1.Init.Priority = DMA_PRIORITY_HIGH;
 
-  if (HAL_DMA_Init(&hdma_adc1) != HAL_OK) {
-      Error_Handler();
-  }
+	if (HAL_DMA_Init(&hdma_adc1) != HAL_OK) {
+		Error_Handler();
+	}
 
-  __HAL_LINKDMA(&hadc1, DMA_Handle, hdma_adc1);
-  /* USER CODE END ADC1_Init 2 */
+	__HAL_LINKDMA(&hadc1, DMA_Handle, hdma_adc1);
+	/* USER CODE END ADC1_Init 2 */
 
 }
 
 /**
-  * @brief CAN Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_CAN_Init(void)
-{
+ * @brief CAN Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_CAN_Init(void) {
 
-  /* USER CODE BEGIN CAN_Init 0 */
+	/* USER CODE BEGIN CAN_Init 0 */
 
-  /* USER CODE END CAN_Init 0 */
+	/* USER CODE END CAN_Init 0 */
 
-  /* USER CODE BEGIN CAN_Init 1 */
+	/* USER CODE BEGIN CAN_Init 1 */
 
-  /* USER CODE END CAN_Init 1 */
-  hcan.Instance = CAN1;
-  hcan.Init.Prescaler = 2;
-  hcan.Init.Mode = CAN_MODE_NORMAL;
-  hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
-  hcan.Init.TimeSeg1 = CAN_BS1_16TQ;
-  hcan.Init.TimeSeg2 = CAN_BS2_1TQ;
-  hcan.Init.TimeTriggeredMode = DISABLE;
-  hcan.Init.AutoBusOff = DISABLE;
-  hcan.Init.AutoWakeUp = DISABLE;
-  hcan.Init.AutoRetransmission = ENABLE;
-  hcan.Init.ReceiveFifoLocked = DISABLE;
-  hcan.Init.TransmitFifoPriority = DISABLE;
-  if (HAL_CAN_Init(&hcan) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN CAN_Init 2 */
+	/* USER CODE END CAN_Init 1 */
+	hcan.Instance = CAN1;
+	hcan.Init.Prescaler = 2;
+	hcan.Init.Mode = CAN_MODE_NORMAL;
+	hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
+	hcan.Init.TimeSeg1 = CAN_BS1_16TQ;
+	hcan.Init.TimeSeg2 = CAN_BS2_1TQ;
+	hcan.Init.TimeTriggeredMode = DISABLE;
+	hcan.Init.AutoBusOff = DISABLE;
+	hcan.Init.AutoWakeUp = DISABLE;
+	hcan.Init.AutoRetransmission = ENABLE;
+	hcan.Init.ReceiveFifoLocked = DISABLE;
+	hcan.Init.TransmitFifoPriority = DISABLE;
+	if (HAL_CAN_Init(&hcan) != HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE BEGIN CAN_Init 2 */
 
+	CAN_FilterTypeDef canfilter;
 
-  CAN_FilterTypeDef canfilter;
+	/* CAN TX */
+	canfilter.FilterBank = 0;
+	canfilter.FilterMode = CAN_FILTERMODE_IDMASK;
+	canfilter.FilterScale = CAN_FILTERSCALE_32BIT;
 
-  /* CAN TX */
-  canfilter.FilterBank = 0;
-  canfilter.FilterMode = CAN_FILTERMODE_IDMASK;
-  canfilter.FilterScale = CAN_FILTERSCALE_32BIT;
+	/* CAN RX */
+	canfilter.FilterBank = 0;
+	canfilter.FilterMode = CAN_FILTERMODE_IDMASK;
+	canfilter.FilterScale = CAN_FILTERSCALE_32BIT;
 
-  /* CAN RX */
-  canfilter.FilterBank = 0;
-  canfilter.FilterMode = CAN_FILTERMODE_IDMASK;
-  canfilter.FilterScale = CAN_FILTERSCALE_32BIT;
+	/* ID 0x101 */
+	canfilter.FilterIdHigh = (0x23 << 5);
+	canfilter.FilterIdLow = 0x0000;
 
-  /* ID 0x101 */
-  canfilter.FilterIdHigh = (0x23 << 5);
-  canfilter.FilterIdLow  = 0x0000;
+	/* Máscara 11 bits */
+	canfilter.FilterMaskIdHigh = (0x7FF << 5);
+	canfilter.FilterMaskIdLow = 0x0000;
 
-  /* Máscara 11 bits */
-  canfilter.FilterMaskIdHigh = (0x7FF << 5);
-  canfilter.FilterMaskIdLow  = 0x0000;
+	canfilter.FilterFIFOAssignment = CAN_RX_FIFO0;
+	canfilter.FilterActivation = ENABLE;
 
-  canfilter.FilterFIFOAssignment = CAN_RX_FIFO0;
-  canfilter.FilterActivation = ENABLE;
+	HAL_CAN_ConfigFilter(&hcan, &canfilter);
 
-  HAL_CAN_ConfigFilter(&hcan, &canfilter);
-
-  /* USER CODE END CAN_Init 2 */
+	/* USER CODE END CAN_Init 2 */
 
 }
 
 /**
-  * @brief TIM3 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM3_Init(void)
-{
+ * @brief TIM2 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_TIM2_Init(void) {
 
-  /* USER CODE BEGIN TIM3_Init 0 */
+	/* USER CODE BEGIN TIM2_Init 0 */
 
-  /* USER CODE END TIM3_Init 0 */
+	/* USER CODE END TIM2_Init 0 */
 
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
+	TIM_ClockConfigTypeDef sClockSourceConfig = { 0 };
+	TIM_MasterConfigTypeDef sMasterConfig = { 0 };
+	TIM_OC_InitTypeDef sConfigOC = { 0 };
 
-  /* USER CODE BEGIN TIM3_Init 1 */
+	/* USER CODE BEGIN TIM2_Init 1 */
 
-  /* USER CODE END TIM3_Init 1 */
-  htim3.Instance = TIM3;
-  htim3.Init.Prescaler = 1000;
-  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 7200;
-  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM3_Init 2 */
+	/* USER CODE END TIM2_Init 1 */
+	htim2.Instance = TIM2;
+	htim2.Init.Prescaler = 71;
+	htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+	htim2.Init.Period = 999;
+	htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+	htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+	if (HAL_TIM_Base_Init(&htim2) != HAL_OK) {
+		Error_Handler();
+	}
+	sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+	if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK) {
+		Error_Handler();
+	}
+	if (HAL_TIM_PWM_Init(&htim2) != HAL_OK) {
+		Error_Handler();
+	}
+	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+	if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK) {
+		Error_Handler();
+	}
+	sConfigOC.OCMode = TIM_OCMODE_PWM1;
+	sConfigOC.Pulse = 0;
+	sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+	sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+	if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE BEGIN TIM2_Init 2 */
 
-  /* USER CODE END TIM3_Init 2 */
-
-}
-
-/**
-  * @brief USART1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART1_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART1_Init 0 */
-
-  /* USER CODE END USART1_Init 0 */
-
-  /* USER CODE BEGIN USART1_Init 1 */
-
-  /* USER CODE END USART1_Init 1 */
-  huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
-  huart1.Init.WordLength = UART_WORDLENGTH_8B;
-  huart1.Init.StopBits = UART_STOPBITS_1;
-  huart1.Init.Parity = UART_PARITY_NONE;
-  huart1.Init.Mode = UART_MODE_TX_RX;
-  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART1_Init 2 */
-
-  /* USER CODE END USART1_Init 2 */
+	/* USER CODE END TIM2_Init 2 */
+	HAL_TIM_MspPostInit(&htim2);
 
 }
 
 /**
-  * Enable DMA controller clock
-  */
-static void MX_DMA_Init(void)
-{
+ * @brief TIM3 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_TIM3_Init(void) {
 
-  /* DMA controller clock enable */
-  __HAL_RCC_DMA1_CLK_ENABLE();
+	/* USER CODE BEGIN TIM3_Init 0 */
 
-  /* DMA interrupt init */
-  /* DMA1_Channel1_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+	/* USER CODE END TIM3_Init 0 */
+
+	TIM_ClockConfigTypeDef sClockSourceConfig = { 0 };
+	TIM_MasterConfigTypeDef sMasterConfig = { 0 };
+
+	/* USER CODE BEGIN TIM3_Init 1 */
+
+	/* USER CODE END TIM3_Init 1 */
+	htim3.Instance = TIM3;
+	htim3.Init.Prescaler = 1000;
+	htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+	htim3.Init.Period = 7200;
+	htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+	htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+	if (HAL_TIM_Base_Init(&htim3) != HAL_OK) {
+		Error_Handler();
+	}
+	sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+	if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK) {
+		Error_Handler();
+	}
+	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+	if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE BEGIN TIM3_Init 2 */
+
+	/* USER CODE END TIM3_Init 2 */
 
 }
 
 /**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
+ * @brief TIM4 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_TIM4_Init(void) {
 
-  /* USER CODE END MX_GPIO_Init_1 */
+	/* USER CODE BEGIN TIM4_Init 0 */
 
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
+	/* USER CODE END TIM4_Init 0 */
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, LED_Hearthbeat_Pin|Led_Debug_P14_Pin|Led_Debug_P15_Pin, GPIO_PIN_RESET);
+	TIM_ClockConfigTypeDef sClockSourceConfig = { 0 };
+	TIM_MasterConfigTypeDef sMasterConfig = { 0 };
+	TIM_OC_InitTypeDef sConfigOC = { 0 };
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(Led_LV_GPIO_Port, Led_LV_Pin, GPIO_PIN_RESET);
+	/* USER CODE BEGIN TIM4_Init 1 */
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(WaterPump_GPIO_Port, WaterPump_Pin, GPIO_PIN_SET);
+	/* USER CODE END TIM4_Init 1 */
+	htim4.Instance = TIM4;
+	htim4.Init.Prescaler = 71;
+	htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+	htim4.Init.Period = 999;
+	htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+	htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+	if (HAL_TIM_Base_Init(&htim4) != HAL_OK) {
+		Error_Handler();
+	}
+	sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+	if (HAL_TIM_ConfigClockSource(&htim4, &sClockSourceConfig) != HAL_OK) {
+		Error_Handler();
+	}
+	if (HAL_TIM_PWM_Init(&htim4) != HAL_OK) {
+		Error_Handler();
+	}
+	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+	if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK) {
+		Error_Handler();
+	}
+	sConfigOC.OCMode = TIM_OCMODE_PWM1;
+	sConfigOC.Pulse = 0;
+	sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+	sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+	if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE BEGIN TIM4_Init 2 */
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, AMS_Pin|Radiator_Pin, GPIO_PIN_SET);
+	/* USER CODE END TIM4_Init 2 */
+	HAL_TIM_MspPostInit(&htim4);
 
-  /*Configure GPIO pins : LED_Hearthbeat_Pin Led_Debug_P14_Pin Led_Debug_P15_Pin */
-  GPIO_InitStruct.Pin = LED_Hearthbeat_Pin|Led_Debug_P14_Pin|Led_Debug_P15_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+}
 
-  /*Configure GPIO pins : Led_LV_Pin AMS_Pin Radiator_Pin */
-  GPIO_InitStruct.Pin = Led_LV_Pin|AMS_Pin|Radiator_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+/**
+ * @brief USART1 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_USART1_UART_Init(void) {
 
-  /*Configure GPIO pin : WaterPump_Pin */
-  GPIO_InitStruct.Pin = WaterPump_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(WaterPump_GPIO_Port, &GPIO_InitStruct);
+	/* USER CODE BEGIN USART1_Init 0 */
 
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
+	/* USER CODE END USART1_Init 0 */
 
-  /* USER CODE END MX_GPIO_Init_2 */
+	/* USER CODE BEGIN USART1_Init 1 */
+
+	/* USER CODE END USART1_Init 1 */
+	huart1.Instance = USART1;
+	huart1.Init.BaudRate = 115200;
+	huart1.Init.WordLength = UART_WORDLENGTH_8B;
+	huart1.Init.StopBits = UART_STOPBITS_1;
+	huart1.Init.Parity = UART_PARITY_NONE;
+	huart1.Init.Mode = UART_MODE_TX_RX;
+	huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+	huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+	if (HAL_UART_Init(&huart1) != HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE BEGIN USART1_Init 2 */
+
+	/* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+ * Enable DMA controller clock
+ */
+static void MX_DMA_Init(void) {
+
+	/* DMA controller clock enable */
+	__HAL_RCC_DMA1_CLK_ENABLE();
+
+	/* DMA interrupt init */
+	/* DMA1_Channel1_IRQn interrupt configuration */
+	HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+	HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+
+}
+
+/**
+ * @brief GPIO Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_GPIO_Init(void) {
+	GPIO_InitTypeDef GPIO_InitStruct = { 0 };
+	/* USER CODE BEGIN MX_GPIO_Init_1 */
+
+	/* USER CODE END MX_GPIO_Init_1 */
+
+	/* GPIO Ports Clock Enable */
+	__HAL_RCC_GPIOC_CLK_ENABLE();
+	__HAL_RCC_GPIOD_CLK_ENABLE();
+	__HAL_RCC_GPIOA_CLK_ENABLE();
+	__HAL_RCC_GPIOB_CLK_ENABLE();
+
+	/*Configure GPIO pin Output Level */
+	HAL_GPIO_WritePin(GPIOC, LED_Hearthbeat_Pin | Led_Debug_P14_Pin | Led_Debug_P15_Pin, GPIO_PIN_RESET);
+
+	/*Configure GPIO pin Output Level */
+	HAL_GPIO_WritePin(Led_LV_GPIO_Port, Led_LV_Pin, GPIO_PIN_RESET);
+
+	/*Configure GPIO pin Output Level */
+	HAL_GPIO_WritePin(AMS_GPIO_Port, AMS_Pin, GPIO_PIN_SET);
+
+	/*Configure GPIO pins : LED_Hearthbeat_Pin Led_Debug_P14_Pin Led_Debug_P15_Pin */
+	GPIO_InitStruct.Pin = LED_Hearthbeat_Pin | Led_Debug_P14_Pin | Led_Debug_P15_Pin;
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+	/*Configure GPIO pins : Led_LV_Pin AMS_Pin */
+	GPIO_InitStruct.Pin = Led_LV_Pin | AMS_Pin;
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+	/* USER CODE BEGIN MX_GPIO_Init_2 */
+
+	/* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
 
-void StartADC1(void)
-{
-    if (adc_counter >= 1)
-    {
-        adc_counter = 0;
+void StartADC1(void) {
+	if (adc_counter >= 1) {
+		adc_counter = 0;
 
-        // Verifica se o ADC não está ocupado (bitmask correta para HAL F1)
-        uint32_t state = HAL_ADC_GetState(&hadc1);
-        if ((state & HAL_ADC_STATE_REG_BUSY) == 0)
-        {
-            HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_dma_raw, 2);
-        }
-    }
+		// Verifica se o ADC não está ocupado (bitmask correta para HAL F1)
+		uint32_t state = HAL_ADC_GetState(&hadc1);
+		if ((state & HAL_ADC_STATE_REG_BUSY) == 0) {
+			HAL_ADC_Start_DMA(&hadc1, (uint32_t*) adc_dma_raw, 2);
+		}
+	}
 
-    if (adc_dma_ready)
-    {
-        adc_dma_ready = 0;
+	if (adc_dma_ready) {
+		adc_dma_ready = 0;
 
-        // Moving average Voltage
-        voltage_sum -= voltage_buffer[voltage_idx];
-        voltage_buffer[voltage_idx] = adc_dma_raw[0];
-        voltage_sum += adc_dma_raw[0];
-        voltage_idx = (voltage_idx + 1) % BUFFER_SIZE;
-        raw_voltage = voltage_sum / BUFFER_SIZE;
+		// Moving average Voltage
+		voltage_sum -= voltage_buffer[voltage_idx];
+		voltage_buffer[voltage_idx] = adc_dma_raw[0];
+		voltage_sum += adc_dma_raw[0];
+		voltage_idx = (voltage_idx + 1) % BUFFER_SIZE;
+		raw_voltage = voltage_sum / BUFFER_SIZE;
 
-        // Moving average PA2
-        current_sum -= current_buffer[current_idx];
-        current_buffer[current_idx] = adc_dma_raw[1];
-        current_sum += adc_dma_raw[1];
-        current_idx = (current_idx + 1) % BUFFER_SIZE;
-        raw_current = current_sum / BUFFER_SIZE;
+		// Moving average PA2
+		current_sum -= current_buffer[current_idx];
+		current_buffer[current_idx] = adc_dma_raw[1];
+		current_sum += adc_dma_raw[1];
+		current_idx = (current_idx + 1) % BUFFER_SIZE;
+		raw_current = current_sum / BUFFER_SIZE;
 
-        VoltageMessure(raw_voltage);
-        MeasureCurrent(raw_current);
-    }
+		VoltageMessure(raw_voltage);
+		MeasureCurrent(raw_current);
+	}
 }
 
-void VoltageMessure(uint16_t adc_voltage)
-{
-    // Converte o valor raw do ADC para Volts
-    voltage_v = (float)adc_voltage * 3.3f / 4095.0f;
+void VoltageMessure(uint16_t adc_voltage) {
+	// Converte o valor raw do ADC para Volts
+	voltage_v = (float) adc_voltage * 3.3f / 4095.0f;
 
-    static uint8_t lv_state = 0;
+	static uint8_t lv_state = 0;
 
-    /* --- LÓGICA DE ESTADOS --- */
-    if (voltage_v >= 3.25f) {
-        // Tensão máxima suportada (ou perto do limite do ADC)
-        lv_state = 2;
-    }
-    else if (voltage_v < 2.8f) {
-        // Baixa tensão
-        lv_state = 1;
-    }
-    else {
-        // Tensão Normal OK (ex: 3.0V)
-        lv_state = 0;
-    }
+	/* --- LÓGICA DE ESTADOS --- */
+	if (voltage_v >= 3.25f) {
+		// Tensão máxima suportada (ou perto do limite do ADC)
+		lv_state = 2;
+	} else if (voltage_v < 2.8f) {
+		// Baixa tensão
+		lv_state = 1;
+	} else {
+		// Tensão Normal OK (ex: 3.0V)
+		lv_state = 0;
+	}
 
-    /* --- CONTROLO DO LED --- */
-    switch (lv_state) {
-        case 2: // TENSÃO MÁXIMA -> Estático LIGADO
-            lv_counter = 0;
-            HAL_GPIO_WritePin(Led_LV_GPIO_Port, Led_LV_Pin, GPIO_PIN_SET);
-            break;
+	/* --- CONTROLO DO LED --- */
+	switch (lv_state) {
+	case 2: // TENSÃO MÁXIMA -> Estático LIGADO
+		lv_counter = 0;
+		HAL_GPIO_WritePin(Led_LV_GPIO_Port, Led_LV_Pin, GPIO_PIN_SET);
+		break;
 
-        case 1: // BAIXA TENSÃO -> Piscar
-            // O valor '5' dita a velocidade do piscar com base no teu Timer 3.
-            // Podes aumentar para piscar mais devagar, ou diminuir para piscar mais rápido.
-            if (lv_counter >= 5) {
-                lv_counter = 0;
-                HAL_GPIO_TogglePin(Led_LV_GPIO_Port, Led_LV_Pin);
-            }
-            break;
+	case 1: // BAIXA TENSÃO -> Piscar
+		// O valor '5' dita a velocidade do piscar com base no teu Timer 3.
+		// Podes aumentar para piscar mais devagar, ou diminuir para piscar mais rápido.
+		if (lv_counter >= 5) {
+			lv_counter = 0;
+			HAL_GPIO_TogglePin(Led_LV_GPIO_Port, Led_LV_Pin);
+		}
+		break;
 
-        case 0: // TENSÃO NORMAL -> Estático DESLIGADO
-            lv_counter = 0;
-            HAL_GPIO_WritePin(Led_LV_GPIO_Port, Led_LV_Pin, GPIO_PIN_RESET);
-            break;
-    }
+	case 0: // TENSÃO NORMAL -> Estático DESLIGADO
+		lv_counter = 0;
+		HAL_GPIO_WritePin(Led_LV_GPIO_Port, Led_LV_Pin, GPIO_PIN_RESET);
+		break;
+	}
 }
 
-void MeasureCurrent(uint16_t adc_value)
-{
-    current_v = (float)adc_value * 3.3f / 4095.0f;
+void MeasureCurrent(uint16_t adc_value) {
+	current_v = (float) adc_value * 3.3f / 4095.0f;
 }
 
 void SendData(void) {
-    if (data_trigger >= 10) {
-        data_trigger = 0;
+	if (data_trigger >= 10) {
+		data_trigger = 0;
 
-        // UART — imprime float diretamente
-        printf("PA1: %.3f V | PA2: %.3f V\r\n", voltage_v, current_v);
+		// UART — imprime float diretamente
+		printf("PA1: %.3f V | PA2: %.3f V\r\n", voltage_v, current_v);
 
-        // CAN — envia como inteiro x1000 (ex: 3.009V → 3009)
-        // Assim preservas 3 casas decimais sem float no CAN
-        uint16_t can_voltage = (uint16_t)(voltage_v * 1000.0f);  // ex: 3009
-        uint16_t can_current = (uint16_t)(current_v * 1000.0f);  // ex: 3530
+		// CAN — envia como inteiro x1000 (ex: 3.009V → 3009)
+		// Assim preservas 3 casas decimais sem float no CAN
+		uint16_t can_voltage = (uint16_t) (voltage_v * 1000.0f);  // ex: 3009
+		uint16_t can_current = (uint16_t) (current_v * 1000.0f);  // ex: 3530
 
-        TxData[0] = (can_voltage >> 8) & 0xFF;  // High byte
-        TxData[1] =  can_voltage       & 0xFF;  // Low byte
-        TxData[2] = (can_current >> 8) & 0xFF;
-        TxData[3] =  can_current       & 0xFF;
-        TxHeader.DLC = 4;
+		TxData[0] = (can_voltage >> 8) & 0xFF;  // High byte
+		TxData[1] = can_voltage & 0xFF;  // Low byte
+		TxData[2] = (can_current >> 8) & 0xFF;
+		TxData[3] = can_current & 0xFF;
+		TxHeader.DLC = 4;
 
-        if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan) == 0) {
-            HAL_CAN_AbortTxRequest(&hcan, CAN_TX_MAILBOX0);
-            HAL_CAN_AbortTxRequest(&hcan, CAN_TX_MAILBOX1);
-            HAL_CAN_AbortTxRequest(&hcan, CAN_TX_MAILBOX2);
-            printf("WARNING: CAN congestionado.\r\n");
-        }
+		if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan) == 0) {
+			HAL_CAN_AbortTxRequest(&hcan, CAN_TX_MAILBOX0);
+			HAL_CAN_AbortTxRequest(&hcan, CAN_TX_MAILBOX1);
+			HAL_CAN_AbortTxRequest(&hcan, CAN_TX_MAILBOX2);
+			printf("WARNING: CAN congestionado.\r\n");
+		}
 
-        if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan) > 0) {
-            HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox);
-            HAL_GPIO_TogglePin(GPIOC, Led_Debug_P15_Pin);
-        } else {
-            printf("CRITICAL ERROR: Falha CAN.\r\n");
-        }
-    }
+		if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan) > 0) {
+			HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox);
+			HAL_GPIO_TogglePin(GPIOC, Led_Debug_P15_Pin);
+		} else {
+			printf("CRITICAL ERROR: Falha CAN.\r\n");
+		}
+	}
 }
 
 void HeartbeatTask(void) {
-    // Substitui o HAL_Delay de 5 segundos que trancava o Loop.
-    // Pisca o LED da mesma forma, mas permitindo que a CAN e o ADC fluam
-    if (heartbeat_counter >= 5) { // Ajuste este valor dependendo do tick rate do TIM3 para chegar a 5000ms ou 500ms
-        heartbeat_counter = 0;
-        HAL_GPIO_TogglePin(GPIOC, LED_Hearthbeat_Pin);
-    }
+	// Substitui o HAL_Delay de 5 segundos que trancava o Loop.
+	// Pisca o LED da mesma forma, mas permitindo que a CAN e o ADC fluam
+	if (heartbeat_counter >= 5) { // Ajuste este valor dependendo do tick rate do TIM3 para chegar a 5000ms ou 500ms
+		heartbeat_counter = 0;
+		HAL_GPIO_TogglePin(GPIOC, LED_Hearthbeat_Pin);
+	}
 }
 
 /* USER CODE END 4 */
 
 /**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
-void Error_Handler(void)
-{
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
-  while (1)
-  {
-  }
-  /* USER CODE END Error_Handler_Debug */
+ * @brief  This function is executed in case of error occurrence.
+ * @retval None
+ */
+void Error_Handler(void) {
+	/* USER CODE BEGIN Error_Handler_Debug */
+	/* User can add his own implementation to report the HAL error return state */
+	__disable_irq();
+	while (1) {
+	}
+	/* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef  USE_FULL_ASSERT

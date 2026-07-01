@@ -246,6 +246,10 @@ int main(void)
 	//SendData();                   // Envia dados UART e CAN
 	HeartbeatTask();              // Pisca o LED Heartbeat de forma não bloqueante
 
+	HAL_GPIO_WritePin(GPIOB, Radiator_Pin, GPIO_PIN_RESET); // Invert Logic 0 -> 1
+	HAL_GPIO_WritePin(GPIOB, AMS_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(GPIOA, WaterPump_Pin, GPIO_PIN_RESET);
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */

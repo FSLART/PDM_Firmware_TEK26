@@ -60,8 +60,8 @@ all: main-build
 main-build: PDM_Firmware_V1.21-main.elf secondary-outputs
 
 # Tool invocations
-PDM_Firmware_V1.21-main.elf PDM_Firmware_V1.21-main.map: $(OBJS) $(USER_OBJS) C:\Users\Dmytro\Documents\BackupProjeto_STM32\PDM_Firmware_V1.21-main\STM32F103C8TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "PDM_Firmware_V1.21-main.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"C:\Users\Dmytro\Documents\BackupProjeto_STM32\PDM_Firmware_V1.21-main\STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="PDM_Firmware_V1.21-main.map" -Wl,--gc-sections -static -u _printf_float --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+PDM_Firmware_V1.21-main.elf PDM_Firmware_V1.21-main.map: $(OBJS) $(USER_OBJS) C:\Users\jpser\Documents\GitHub\PDM_Firmware_TEK26\STM32F103C8TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "PDM_Firmware_V1.21-main.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"C:\Users\jpser\Documents\GitHub\PDM_Firmware_TEK26\STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="PDM_Firmware_V1.21-main.map" -Wl,--gc-sections -static -u _printf_float --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

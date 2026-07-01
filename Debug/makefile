@@ -34,34 +34,34 @@ $(wildcard ../makefile.init) \
 $(wildcard ../makefile.targets) \
 
 
-BUILD_ARTIFACT_NAME := PDM_CANTX
+BUILD_ARTIFACT_NAME := PDM_Firmware_V1.21-main
 BUILD_ARTIFACT_EXTENSION := elf
 BUILD_ARTIFACT_PREFIX :=
 BUILD_ARTIFACT := $(BUILD_ARTIFACT_PREFIX)$(BUILD_ARTIFACT_NAME)$(if $(BUILD_ARTIFACT_EXTENSION),.$(BUILD_ARTIFACT_EXTENSION),)
 
 # Add inputs and outputs from these tool invocations to the build variables 
 EXECUTABLES += \
-PDM_CANTX.elf \
+PDM_Firmware_V1.21-main.elf \
 
 MAP_FILES += \
-PDM_CANTX.map \
+PDM_Firmware_V1.21-main.map \
 
 SIZE_OUTPUT += \
 default.size.stdout \
 
 OBJDUMP_LIST += \
-PDM_CANTX.list \
+PDM_Firmware_V1.21-main.list \
 
 
 # All Target
 all: main-build
 
 # Main-build Target
-main-build: PDM_CANTX.elf secondary-outputs
+main-build: PDM_Firmware_V1.21-main.elf secondary-outputs
 
 # Tool invocations
-PDM_CANTX.elf PDM_CANTX.map: $(OBJS) $(USER_OBJS) C:\Users\Dmytro\Documents\BackupProjeto_STM32\PDM_CANTX\STM32F103C8TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "PDM_CANTX.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"C:\Users\Dmytro\Documents\BackupProjeto_STM32\PDM_CANTX\STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="PDM_CANTX.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+PDM_Firmware_V1.21-main.elf PDM_Firmware_V1.21-main.map: $(OBJS) $(USER_OBJS) C:\Users\Dmytro\Documents\BackupProjeto_STM32\PDM_Firmware_V1.21-main\STM32F103C8TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "PDM_Firmware_V1.21-main.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"C:\Users\Dmytro\Documents\BackupProjeto_STM32\PDM_Firmware_V1.21-main\STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="PDM_Firmware_V1.21-main.map" -Wl,--gc-sections -static -u _printf_float --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 
@@ -70,14 +70,14 @@ default.size.stdout: $(EXECUTABLES) makefile objects.list $(OPTIONAL_TOOL_DEPS)
 	@echo 'Finished building: $@'
 	@echo ' '
 
-PDM_CANTX.list: $(EXECUTABLES) makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-objdump -h -S $(EXECUTABLES) > "PDM_CANTX.list"
+PDM_Firmware_V1.21-main.list: $(EXECUTABLES) makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-objdump -h -S $(EXECUTABLES) > "PDM_Firmware_V1.21-main.list"
 	@echo 'Finished building: $@'
 	@echo ' '
 
 # Other Targets
 clean:
-	-$(RM) PDM_CANTX.elf PDM_CANTX.list PDM_CANTX.map default.size.stdout
+	-$(RM) PDM_Firmware_V1.21-main.elf PDM_Firmware_V1.21-main.list PDM_Firmware_V1.21-main.map default.size.stdout
 	-@echo ' '
 
 secondary-outputs: $(SIZE_OUTPUT) $(OBJDUMP_LIST)

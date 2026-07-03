@@ -47,7 +47,8 @@ typedef struct {
 	uint32_t temps_age_ms;      // há quanto tempo não chega frame de temperatura
 
 	/* LV battery / corrente */
-	float lv_voltage_v;
+	float lv_voltage_v;         // tensão no pino do MCU (0-3.3V)
+	float lv_battery_voltage_v; // tensão real da bateria (após divisores)
 	uint16_t lv_voltage_raw;
 	float current_v;
 	uint16_t current_raw;
@@ -70,6 +71,11 @@ typedef struct {
 /* USER CODE BEGIN PD */
 #define BUFFER_SIZE 10
 #define VREF_MV     3300   // STM32 reference voltage in mV
+
+/* --- Divisor da LV battery ---
+   24V --470k-- nó --100k-- GND -> buffer (segue o nó) -> 1k -- pino MCU -- 2k -- GND
+   Vmcu = Vbat * (100/570) * (2/3) = Vbat / 8.55  =>  Vbat = Vmcu * 8.55 */
+#define LV_DIVIDER_RATIO    8.55f
 
 /* --- Cooling control --- */
 #define COOLING_TEMP_MIN_C     35.0f   // Below this -> 0% PWM
@@ -125,6 +131,7 @@ uint16_t raw_voltage = 0;
 uint16_t raw_current = 0;
 
 float voltage_v = 0.0f;   // PA1 em Volts  ex: 3.009
+float lv_battery_voltage_v = 0.0f;   // Tensão real da bateria LV (voltage_v * LV_DIVIDER_RATIO)
 float current_v = 0.0f;   // PA2 em Volts  ex: 3.530
 uint16_t current_frac = 0;
 
@@ -886,6 +893,7 @@ void Debug_Update(void) {
 	dbg.temps_age_ms = HAL_GetTick() - last_temps_tick_ms;
 
 	dbg.lv_voltage_v = voltage_v;
+	dbg.lv_battery_voltage_v = lv_battery_voltage_v;
 	dbg.lv_voltage_raw = raw_voltage;
 	dbg.current_v = current_v;
 	dbg.current_raw = raw_current;
@@ -909,9 +917,9 @@ void PDM_SendPeriodic(void) {
 
 	uint8_t buf[8];
 
-	/* PDM_LV (0x210) - tensão LV */
+	/* PDM_LV (0x210) - tensão real da bateria LV (não a tensão no pino do MCU) */
 	struct data_t26_pdm_lv_t lv_msg;
-	lv_msg.lv_voltage_m_v = data_t26_pdm_lv_lv_voltage_m_v_encode(voltage_v); // V -> mV
+	lv_msg.lv_voltage_m_v = data_t26_pdm_lv_lv_voltage_m_v_encode(lv_battery_voltage_v); // V -> mV
 	data_t26_pdm_lv_pack(buf, &lv_msg, sizeof(buf));
 	CAN_Send(DATA_T26_PDM_LV_FRAME_ID, buf, DATA_T26_PDM_LV_LENGTH);
 
@@ -959,6 +967,9 @@ void StartADC1(void) {
 void VoltageMessure(uint16_t adc_voltage) {
 	// Converte o valor raw do ADC para Volts
 	voltage_v = (float) adc_voltage * 3.3f / 4095.0f;
+
+	// Desfaz os dois divisores resistivos -> tensão real da bateria LV
+	lv_battery_voltage_v = voltage_v * LV_DIVIDER_RATIO;
 
 	static uint8_t lv_state = 0;
 

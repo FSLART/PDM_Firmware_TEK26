@@ -24,10 +24,45 @@
 #include "string.h"
 #include "stdio.h"
 #include "stdlib.h"
+
+#include "data_t26.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
+/* Snapshot de todo o estado útil para debug - ver como Live Expression
+ (adiciona só "dbg" e expande). Atualizado a cada iteração do loop. */
+typedef struct {
+	/* PWM aplicado (0-100%) */
+	uint8_t fan_pwm;
+	uint8_t pump_pwm;
+	uint8_t cooling_active;
+
+	/* Temperaturas dos inversores (°C) */
+	float inv1_inverter_temp_c;
+	float inv1_motor_temp_c;
+	float inv2_inverter_temp_c;
+	float inv2_motor_temp_c;
+	uint32_t temps_age_ms;      // há quanto tempo não chega frame de temperatura
+
+	/* LV battery / corrente */
+	float lv_voltage_v;
+	uint16_t lv_voltage_raw;
+	float current_v;
+	uint16_t current_raw;
+
+	/* Estado do bus CAN */
+	HAL_CAN_StateTypeDef can_state;
+	uint32_t can_error_code;
+	uint32_t can_rx_count;
+	uint32_t can_tx_ok_count;
+	uint32_t can_tx_fail_count;
+	uint32_t can_last_rx_id;
+	uint32_t can_rx_age_ms;     // há quanto tempo não chega frame nenhum
+
+	uint32_t uptime_ms;
+} debug_view_t;
 
 /* USER CODE END PTD */
 
@@ -35,6 +70,17 @@
 /* USER CODE BEGIN PD */
 #define BUFFER_SIZE 10
 #define VREF_MV     3300   // STM32 reference voltage in mV
+
+/* --- Cooling control --- */
+#define COOLING_TEMP_MIN_C     35.0f   // Below this -> 0% PWM
+#define COOLING_TEMP_MAX_C     65.0f   // At or above this -> 100% PWM
+#define COOLING_HYSTERESIS_C   5.0f    // Só desliga abaixo de (MIN - isto)
+#define COOLING_TABLE_SIZE     2
+
+/* --- Periodic CAN TX --- */
+#define TIM3_TICK_MS           100     // TIM3 interrupt period (72MHz/1001/7201 ~ 100ms)
+#define CAN_TX_PERIOD_MS       1000    // All periodic messages sent every 1 second
+#define CAN_TX_PERIOD_TICKS    (CAN_TX_PERIOD_MS / TIM3_TICK_MS)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -88,6 +134,17 @@ uint8_t data_trigger = 0;
 uint16_t lv_counter = 0;
 uint16_t heartbeat_counter = 0;
 
+/* Estatísticas CAN (para debug_view_t) */
+volatile uint32_t can_rx_count = 0;
+volatile uint32_t can_tx_ok_count = 0;
+volatile uint32_t can_tx_fail_count = 0;
+volatile uint32_t can_last_rx_id = 0;
+volatile uint32_t last_rx_tick_ms = 0;
+volatile uint32_t last_temps_tick_ms = 0;
+
+/* Snapshot único para Live Expressions - ver debug_view_t */
+volatile debug_view_t dbg;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -107,11 +164,40 @@ void VoltageMessure(uint16_t raw_voltage);
 void MeasureCurrent(uint16_t adc_value);
 void SendData(void);
 void HeartbeatTask(void);
+void Cooling_Update(void);
+void PDM_SendPeriodic(void);
+void Debug_Update(void);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* Tabela de arrefecimento: temperatura -> PWM (%). Interpolação linear entre pontos. */
+typedef struct {
+	float temp_c;
+	uint8_t pump_pwm;
+	uint8_t fan_pwm;
+} cooling_point_t;
+
+static const cooling_point_t cooling_table[COOLING_TABLE_SIZE] = {
+/* temp   pump  fan  */
+{ 35.0f, 0, 0 }, { 65.0f, 100, 100 }, // linear entre COOLING_TEMP_MIN_C e COOLING_TEMP_MAX_C
+		};
+
+/* Últimas temperaturas recebidas dos inversores (ºC) */
+float inv1_temp_inverter_c = 0.0f;
+float inv1_temp_motor_c = 0.0f;
+float inv2_temp_inverter_c = 0.0f;
+float inv2_temp_motor_c = 0.0f;
+volatile uint8_t inv_temps_updated = 0;
+
+/* PWM atualmente aplicado (também vai no CAN PDM_Cooling) */
+uint8_t pump_pwm_now = 0;
+uint8_t fan_pwm_now = 0;
+uint8_t cooling_active = 0;   // estado da histerese (ver Cooling_Update)
+
+uint16_t pdm_tx_counter = 0;   // incrementado pelo TIM3, dispara TX a 1s
 
 /* EUSART */
 int __io_putchar(int ch) {
@@ -133,34 +219,63 @@ void WaterPump_SetPWM(uint8_t percentagem)  // 0..100
 	__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, (uint32_t )percentagem * 10);
 }
 
-
 /* CAN RX */
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
 	if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK)
 		return;
 
-	/* Confere ID */
-	//if (RxHeader.StdId == 0x23 && RxHeader.IDE == CAN_ID_STD)
-	if (RxHeader.StdId == 0x23) {
-		if (RxData[5] == 0x00) // If ID = 23 and Data = 01, OFF
-				{
+	/* Todos os IDs deste projeto são standard de 11 bits. Frames extended
+	 são tráfego alheio - ignorar antes do switch (ver decode do VCU). */
+	if (RxHeader.IDE == CAN_ID_EXT)
+		return;
+
+	can_rx_count++;
+	can_last_rx_id = RxHeader.StdId;
+	last_rx_tick_ms = HAL_GetTick();
+
+	switch (RxHeader.StdId) {
+
+	/* ---- Comando ON/OFF manual (0x23) ---- */
+	case 0x23:
+		if (RxData[5] == 0x00) {
 			Radiator_SetPWM(0);
 			WaterPump_SetPWM(0);
 			HAL_GPIO_WritePin(GPIOA, WaterPump_Pin, GPIO_PIN_SET);
-
-			/* Debug EUSART */
-			char *test_msg = "Radiator, AMS, WaterPump OFF\r\n";
-			HAL_UART_Transmit(&huart1, (uint8_t*) test_msg, strlen(test_msg), 100);
-		} else if (RxData[5] == 0x01) // If ID = 23 and Data = 00, ON
-				{
+			printf("Radiator, AMS, WaterPump OFF\r\n");
+		} else if (RxData[5] == 0x01) {
 			Radiator_SetPWM(100);
 			WaterPump_SetPWM(100);
 			HAL_GPIO_WritePin(GPIOA, WaterPump_Pin, GPIO_PIN_RESET);
-
-			/* Debug EUSART */
-			char *test_msg = "Radiator, AMS, WaterPump ON\r\n";
-			HAL_UART_Transmit(&huart1, (uint8_t*) test_msg, strlen(test_msg), 100);
+			printf("Radiator, AMS, WaterPump ON\r\n");
 		}
+		break;
+
+		/* ---- Temperaturas INV1 (0x444) ---- */
+	case DATA_T26_INV1_TEMPERATURES_FRAME_ID: {
+		struct data_t26_inv1_temperatures_t m;
+		if (data_t26_inv1_temperatures_unpack(&m, RxData, RxHeader.DLC) == 0) {
+			inv1_temp_inverter_c = data_t26_inv1_temperatures_inv1_temp_inverter_decode(m.inv1_temp_inverter);
+			inv1_temp_motor_c = data_t26_inv1_temperatures_inv1_temp_motor_decode(m.inv1_temp_motor);
+			inv_temps_updated = 1;
+			last_temps_tick_ms = HAL_GetTick();
+		}
+		break;
+	}
+
+		/* ---- Temperaturas INV2 (0x445) ---- */
+	case DATA_T26_INV2_TEMPERATURES_FRAME_ID: {
+		struct data_t26_inv2_temperatures_t m;
+		if (data_t26_inv2_temperatures_unpack(&m, RxData, RxHeader.DLC) == 0) {
+			inv2_temp_inverter_c = data_t26_inv2_temperatures_inv2_temp_inverter_decode(m.inv2_temp_inverter);
+			inv2_temp_motor_c = data_t26_inv2_temperatures_inv2_temp_motor_decode(m.inv2_temp_motor);
+			inv_temps_updated = 1;
+			last_temps_tick_ms = HAL_GetTick();
+		}
+		break;
+	}
+
+	default:
+		break;
 	}
 }
 
@@ -171,6 +286,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 		data_trigger++;
 		lv_counter++;
 		heartbeat_counter++;
+		pdm_tx_counter++;
 	}
 }
 
@@ -225,6 +341,15 @@ int main(void) {
 		Error_Handler();
 	}
 
+	/* Iniciar geração de PWM (bomba de água e ventoinha) - sem isto o CCR
+	   é atualizado mas nunca chega ao pino */
+	if (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1) != HAL_OK) {
+		Error_Handler();
+	}
+	if (HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1) != HAL_OK) {
+		Error_Handler();
+	}
+
 	/* CAN */
 	HAL_CAN_Start(&hcan);
 	TxHeader.StdId = 0x123; // ID
@@ -254,18 +379,15 @@ int main(void) {
 	/* USER CODE BEGIN WHILE */
 	while (1) {
 
-		//StartADC1();                  // Executa a leitura do ADC periodicamente
+		StartADC1();                  // Executa a leitura do ADC periodicamente
 		//VoltageMessure(raw_voltage);  // Avalia tensão e atualiza LED LV
 		//MeasureCurrent(raw_current);  // Calcula e processa a corrente
 		//SendData();                   // Envia dados UART e CAN
 		HeartbeatTask();              // Pisca o LED Heartbeat de forma não bloqueante
 
-		//HAL_GPIO_WritePin(GPIOB, Radiator_Pin, GPIO_PIN_RESET); // Invert Logic 0 -> 1
-		//HAL_GPIO_WritePin(GPIOB, AMS_Pin, GPIO_PIN_RESET);
-		//HAL_GPIO_WritePin(GPIOA, WaterPump_Pin, GPIO_PIN_RESET);
-
-		Radiator_SetPWM(100);
-		WaterPump_SetPWM(100);
+		Cooling_Update();     // interpola tabela e aplica PWM
+		PDM_SendPeriodic();   // envia 0x210 e 0x220 a cada 1s
+		Debug_Update();       // atualiza snapshot "dbg" para Live Expressions
 
 		/* USER CODE END WHILE */
 
@@ -414,24 +536,14 @@ static void MX_CAN_Init(void) {
 
 	CAN_FilterTypeDef canfilter;
 
-	/* CAN TX */
+	/* Aceita todas as mensagens - a filtragem é feita por software no callback */
 	canfilter.FilterBank = 0;
 	canfilter.FilterMode = CAN_FILTERMODE_IDMASK;
 	canfilter.FilterScale = CAN_FILTERSCALE_32BIT;
-
-	/* CAN RX */
-	canfilter.FilterBank = 0;
-	canfilter.FilterMode = CAN_FILTERMODE_IDMASK;
-	canfilter.FilterScale = CAN_FILTERSCALE_32BIT;
-
-	/* ID 0x101 */
-	canfilter.FilterIdHigh = (0x23 << 5);
+	canfilter.FilterIdHigh = 0x0000;
 	canfilter.FilterIdLow = 0x0000;
-
-	/* Máscara 11 bits */
-	canfilter.FilterMaskIdHigh = (0x7FF << 5);
+	canfilter.FilterMaskIdHigh = 0x0000;   // máscara 0 -> aceita tudo
 	canfilter.FilterMaskIdLow = 0x0000;
-
 	canfilter.FilterFIFOAssignment = CAN_RX_FIFO0;
 	canfilter.FilterActivation = ENABLE;
 
@@ -680,6 +792,136 @@ static void MX_GPIO_Init(void) {
 }
 
 /* USER CODE BEGIN 4 */
+
+/* Devolve o maior valor de 4 floats */
+static float MaxOf4(float a, float b, float c, float d) {
+	float max = a;
+	if (b > max)
+		max = b;
+	if (c > max)
+		max = c;
+	if (d > max)
+		max = d;
+	return max;
+}
+
+/* Interpola a tabela de arrefecimento para uma dada temperatura */
+void Cooling_LookupPWM(float temp_c, uint8_t *pump_pwm, uint8_t *fan_pwm) {
+	/* Abaixo do primeiro ponto */
+	if (temp_c <= cooling_table[0].temp_c) {
+		*pump_pwm = cooling_table[0].pump_pwm;
+		*fan_pwm = cooling_table[0].fan_pwm;
+		return;
+	}
+	/* Acima do último ponto -> 100% */
+	if (temp_c >= cooling_table[COOLING_TABLE_SIZE - 1].temp_c) {
+		*pump_pwm = cooling_table[COOLING_TABLE_SIZE - 1].pump_pwm;
+		*fan_pwm = cooling_table[COOLING_TABLE_SIZE - 1].fan_pwm;
+		return;
+	}
+	/* Encontra o segmento e interpola linearmente */
+	for (uint8_t i = 0; i < COOLING_TABLE_SIZE - 1; i++) {
+		if (temp_c < cooling_table[i + 1].temp_c) {
+			float t0 = cooling_table[i].temp_c;
+			float t1 = cooling_table[i + 1].temp_c;
+			float frac = (temp_c - t0) / (t1 - t0);   // 0.0 .. 1.0 dentro do segmento
+
+			*pump_pwm = (uint8_t) (cooling_table[i].pump_pwm + frac * (cooling_table[i + 1].pump_pwm - cooling_table[i].pump_pwm));
+			*fan_pwm = (uint8_t) (cooling_table[i].fan_pwm + frac * (cooling_table[i + 1].fan_pwm - cooling_table[i].fan_pwm));
+			return;
+		}
+	}
+}
+
+/* Corre no main loop: pega na temperatura mais alta e aplica o PWM */
+void Cooling_Update(void) {
+	if (!inv_temps_updated)
+		return;
+	inv_temps_updated = 0;
+
+	float max_temp = MaxOf4(inv1_temp_inverter_c, inv1_temp_motor_c, inv2_temp_inverter_c, inv2_temp_motor_c);
+
+	/* Histerese: liga ao atingir COOLING_TEMP_MIN_C, só desliga abaixo de
+	 (COOLING_TEMP_MIN_C - COOLING_HYSTERESIS_C) - evita oscilar à volta do limiar */
+	if (!cooling_active) {
+		if (max_temp >= COOLING_TEMP_MIN_C)
+			cooling_active = 1;
+	} else {
+		if (max_temp < (COOLING_TEMP_MIN_C - COOLING_HYSTERESIS_C))
+			cooling_active = 0;
+	}
+
+	if (cooling_active) {
+		Cooling_LookupPWM(max_temp, &pump_pwm_now, &fan_pwm_now);
+	} else {
+		pump_pwm_now = 0;
+		fan_pwm_now = 0;
+	}
+
+	WaterPump_SetPWM(pump_pwm_now);
+	Radiator_SetPWM(fan_pwm_now);
+}
+
+/* Helper genérico de TX (evita repetir o código dos mailboxes) */
+static void CAN_Send(uint16_t id, uint8_t *data, uint8_t dlc) {
+	TxHeader.StdId = id;
+	TxHeader.DLC = dlc;
+	if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan) > 0 && HAL_CAN_AddTxMessage(&hcan, &TxHeader, data, &TxMailbox) == HAL_OK) {
+		can_tx_ok_count++;
+	} else {
+		can_tx_fail_count++;
+	}
+}
+
+/* Preenche o snapshot "dbg" - chamar a cada iteração do loop principal */
+void Debug_Update(void) {
+	dbg.fan_pwm = fan_pwm_now;
+	dbg.pump_pwm = pump_pwm_now;
+	dbg.cooling_active = cooling_active;
+
+	dbg.inv1_inverter_temp_c = inv1_temp_inverter_c;
+	dbg.inv1_motor_temp_c = inv1_temp_motor_c;
+	dbg.inv2_inverter_temp_c = inv2_temp_inverter_c;
+	dbg.inv2_motor_temp_c = inv2_temp_motor_c;
+	dbg.temps_age_ms = HAL_GetTick() - last_temps_tick_ms;
+
+	dbg.lv_voltage_v = voltage_v;
+	dbg.lv_voltage_raw = raw_voltage;
+	dbg.current_v = current_v;
+	dbg.current_raw = raw_current;
+
+	dbg.can_state = HAL_CAN_GetState(&hcan);
+	dbg.can_error_code = HAL_CAN_GetError(&hcan);
+	dbg.can_rx_count = can_rx_count;
+	dbg.can_tx_ok_count = can_tx_ok_count;
+	dbg.can_tx_fail_count = can_tx_fail_count;
+	dbg.can_last_rx_id = can_last_rx_id;
+	dbg.can_rx_age_ms = HAL_GetTick() - last_rx_tick_ms;
+
+	dbg.uptime_ms = HAL_GetTick();
+}
+
+/* Envia todas as mensagens periódicas (1 segundo) */
+void PDM_SendPeriodic(void) {
+	if (pdm_tx_counter < CAN_TX_PERIOD_TICKS)
+		return;
+	pdm_tx_counter = 0;
+
+	uint8_t buf[8];
+
+	/* PDM_LV (0x210) - tensão LV */
+	struct data_t26_pdm_lv_t lv_msg;
+	lv_msg.lv_voltage_m_v = data_t26_pdm_lv_lv_voltage_m_v_encode(voltage_v); // V -> mV
+	data_t26_pdm_lv_pack(buf, &lv_msg, sizeof(buf));
+	CAN_Send(DATA_T26_PDM_LV_FRAME_ID, buf, DATA_T26_PDM_LV_LENGTH);
+
+	/* PDM_Cooling (0x220) - PWM atual da bomba e ventoinha */
+	struct data_t26_pdm_cooling_t cool_msg;
+	cool_msg.water_pump_pwm = pump_pwm_now;
+	cool_msg.cooling_fan_pwm = fan_pwm_now;
+	data_t26_pdm_cooling_pack(buf, &cool_msg, sizeof(buf));
+	CAN_Send(DATA_T26_PDM_COOLING_FRAME_ID, buf, DATA_T26_PDM_COOLING_LENGTH);
+}
 
 void StartADC1(void) {
 	if (adc_counter >= 1) {

@@ -74,8 +74,18 @@ typedef struct {
 
 /* --- Divisor da LV battery ---
    24V --470k-- nó --100k-- GND -> buffer (segue o nó) -> 1k -- pino MCU -- 2k -- GND
-   Vmcu = Vbat * (100/570) * (2/3) = Vbat / 8.55  =>  Vbat = Vmcu * 8.55 */
-#define LV_DIVIDER_RATIO    8.55f
+   Teórico: Vmcu = Vbat * (100/570) * (2/3) = Vbat / 8.55
+   Calibrado na bancada: Vbat real 26.6V com Vmcu 3.233V -> 26.6/3.233 = 8.227
+   (desvio vs teórico ~4%, tolerância das resistências) */
+#define LV_DIVIDER_RATIO    8.227f
+
+/* Limiares do LED LV em tensão real da bateria:
+   >= 26V -> estático ligado | 25-26V -> pisca lento | 22-25V -> pisca rápido | < 22V -> desligado */
+#define LV_VOLT_HIGH_V        26.0f
+#define LV_VOLT_MID_V         25.0f
+#define LV_VOLT_LOW_V         22.0f
+#define LV_BLINK_SLOW_TICKS   10     // toggle a cada 10 ticks TIM3 (~1s)
+#define LV_BLINK_FAST_TICKS   4      // toggle a cada 2 ticks TIM3 (~200ms)
 
 /* --- Cooling control --- */
 #define COOLING_TEMP_MIN_C     35.0f   // Below this -> 0% PWM
@@ -212,18 +222,20 @@ int __io_putchar(int ch) {
 	return ch;
 }
 
-void Radiator_SetPWM(uint8_t percentagem)   // 0..100
+void Radiator_SetPWM(uint8_t percentagem)   // 0..100 (100 = potência máxima)
 {
 	if (percentagem > 100)
 		percentagem = 100;
-	__HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, (uint32_t )percentagem * 10);
+	/* Hardware ativo-baixo: duty invertido (100% pedido -> CCR 0) */
+	__HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, (uint32_t )(100 - percentagem) * 10);
 }
 
-void WaterPump_SetPWM(uint8_t percentagem)  // 0..100
+void WaterPump_SetPWM(uint8_t percentagem)  // 0..100 (100 = potência máxima)
 {
 	if (percentagem > 100)
 		percentagem = 100;
-	__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, (uint32_t )percentagem * 10);
+	/* Hardware ativo-baixo: duty invertido (100% pedido -> CCR 0) */
+	__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, (uint32_t )(100 - percentagem) * 10);
 }
 
 /* CAN RX */
@@ -356,6 +368,11 @@ int main(void) {
 	if (HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1) != HAL_OK) {
 		Error_Handler();
 	}
+
+	/* Hardware ativo-baixo: CCR arranca a 0 = 100% de potência. Forçar 0%
+	   já, antes de chegar o primeiro frame de temperaturas. */
+	Radiator_SetPWM(0);
+	WaterPump_SetPWM(0);
 
 	/* CAN */
 	HAL_CAN_Start(&hcan);
@@ -973,35 +990,43 @@ void VoltageMessure(uint16_t adc_voltage) {
 
 	static uint8_t lv_state = 0;
 
-	/* --- LÓGICA DE ESTADOS --- */
-	if (voltage_v >= 3.25f) {
-		// Tensão máxima suportada (ou perto do limite do ADC)
+	/* --- LÓGICA DE ESTADOS (tensão real da bateria, não a do pino) --- */
+	if (lv_battery_voltage_v >= LV_VOLT_HIGH_V) {
+		// >= 26V -> estático ligado
+		lv_state = 3;
+	} else if (lv_battery_voltage_v >= LV_VOLT_MID_V) {
+		// 25-26V -> pisca lento
 		lv_state = 2;
-	} else if (voltage_v < 2.8f) {
-		// Baixa tensão
+	} else if (lv_battery_voltage_v >= LV_VOLT_LOW_V) {
+		// 22-25V -> pisca rápido
 		lv_state = 1;
 	} else {
-		// Tensão Normal OK (ex: 3.0V)
+		// < 22V -> desligado
 		lv_state = 0;
 	}
 
 	/* --- CONTROLO DO LED --- */
 	switch (lv_state) {
-	case 2: // TENSÃO MÁXIMA -> Estático LIGADO
+	case 3: // Estático LIGADO
 		lv_counter = 0;
 		HAL_GPIO_WritePin(Led_LV_GPIO_Port, Led_LV_Pin, GPIO_PIN_SET);
 		break;
 
-	case 1: // BAIXA TENSÃO -> Piscar
-		// O valor '5' dita a velocidade do piscar com base no teu Timer 3.
-		// Podes aumentar para piscar mais devagar, ou diminuir para piscar mais rápido.
-		if (lv_counter >= 5) {
+	case 2: // Pisca lento
+		if (lv_counter >= LV_BLINK_SLOW_TICKS) {
 			lv_counter = 0;
 			HAL_GPIO_TogglePin(Led_LV_GPIO_Port, Led_LV_Pin);
 		}
 		break;
 
-	case 0: // TENSÃO NORMAL -> Estático DESLIGADO
+	case 1: // Pisca rápido
+		if (lv_counter >= LV_BLINK_FAST_TICKS) {
+			lv_counter = 0;
+			HAL_GPIO_TogglePin(Led_LV_GPIO_Port, Led_LV_Pin);
+		}
+		break;
+
+	case 0: // Estático DESLIGADO
 		lv_counter = 0;
 		HAL_GPIO_WritePin(Led_LV_GPIO_Port, Led_LV_Pin, GPIO_PIN_RESET);
 		break;

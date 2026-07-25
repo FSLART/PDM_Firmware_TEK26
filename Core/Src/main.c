@@ -226,16 +226,16 @@ void Radiator_SetPWM(uint8_t percentagem)   // 0..100 (100 = potência máxima)
 {
 	if (percentagem > 100)
 		percentagem = 100;
-	/* Hardware ativo-baixo: duty invertido (100% pedido -> CCR 0) */
-	__HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, (uint32_t )(100 - percentagem) * 10);
+	/* Placa nova com MOSFET canal-N: ativo-alto, duty direto */
+	__HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, (uint32_t )percentagem * 10);
 }
 
 void WaterPump_SetPWM(uint8_t percentagem)  // 0..100 (100 = potência máxima)
 {
 	if (percentagem > 100)
 		percentagem = 100;
-	/* Hardware ativo-baixo: duty invertido (100% pedido -> CCR 0) */
-	__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, (uint32_t )(100 - percentagem) * 10);
+	/* Placa nova com MOSFET canal-N: ativo-alto, duty direto */
+	__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, (uint32_t )percentagem * 10);
 }
 
 /* CAN RX */
@@ -369,8 +369,7 @@ int main(void) {
 		Error_Handler();
 	}
 
-	/* Hardware ativo-baixo: CCR arranca a 0 = 100% de potência. Forçar 0%
-	   já, antes de chegar o primeiro frame de temperaturas. */
+	/* Garantir 0% de potência no arranque (canal-N: CCR 0 = desligado) */
 	Radiator_SetPWM(0);
 	WaterPump_SetPWM(0);
 

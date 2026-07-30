@@ -61,6 +61,7 @@ typedef struct {
 	uint32_t can_tx_fail_count;
 	uint32_t can_last_rx_id;
 	uint32_t can_rx_age_ms;     // há quanto tempo não chega frame nenhum
+	uint32_t temp_frames_rejeitados;   // frames de temperatura descartados (implausíveis)
 
 	uint32_t uptime_ms;
 } debug_view_t;
@@ -88,9 +89,10 @@ typedef struct {
 #define LV_BLINK_FAST_TICKS   4      // toggle a cada 2 ticks TIM3 (~200ms)
 
 /* --- Cooling control --- */
-#define COOLING_TEMP_MIN_C     35.0f   // Below this -> 0% PWM
+#define COOLING_TEMP_MIN_C     40.0f   // Below this -> 0% PWM
 #define COOLING_TEMP_MAX_C     65.0f   // At or above this -> 100% PWM
 #define COOLING_HYSTERESIS_C   5.0f    // Só desliga abaixo de (MIN - isto)
+#define COOLING_PWM_DEADBAND   3       // Só reaplica PWM se mudar >= isto (%)
 #define COOLING_TABLE_SIZE     2
 
 /* --- Periodic CAN TX --- */
@@ -156,6 +158,7 @@ volatile uint32_t can_rx_count = 0;
 volatile uint32_t can_tx_ok_count = 0;
 volatile uint32_t can_tx_fail_count = 0;
 volatile uint32_t can_last_rx_id = 0;
+volatile uint32_t temp_frames_rejeitados = 0;   // frames de temperatura com valores implausíveis
 volatile uint32_t last_rx_tick_ms = 0;
 volatile uint32_t last_temps_tick_ms = 0;
 
@@ -181,6 +184,7 @@ void VoltageMessure(uint16_t raw_voltage);
 void MeasureCurrent(uint16_t adc_value);
 void SendData(void);
 void HeartbeatTask(void);
+void CAN_ProcessRx(void);
 void Cooling_Update(void);
 void PDM_SendPeriodic(void);
 void Debug_Update(void);
@@ -199,7 +203,7 @@ typedef struct {
 
 static const cooling_point_t cooling_table[COOLING_TABLE_SIZE] = {
 /* temp   pump  fan  */
-{ 35.0f, 0, 0 }, { 65.0f, 100, 100 }, // linear entre COOLING_TEMP_MIN_C e COOLING_TEMP_MAX_C
+{ 40.0f, 0, 0 }, { 65.0f, 100, 100 }, // linear entre COOLING_TEMP_MIN_C e COOLING_TEMP_MAX_C
 		};
 
 /* Últimas temperaturas recebidas dos inversores (ºC) */
@@ -226,17 +230,34 @@ void Radiator_SetPWM(uint8_t percentagem)   // 0..100 (100 = potência máxima)
 {
 	if (percentagem > 100)
 		percentagem = 100;
-	/* Placa nova com MOSFET canal-N: ativo-alto, duty direto */
-	__HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, (uint32_t )percentagem * 10);
+	/* Hardware ativo-baixo: duty invertido (100% pedido -> CCR 0) */
+	__HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, (uint32_t )(100 - percentagem) * 10);
 }
 
 void WaterPump_SetPWM(uint8_t percentagem)  // 0..100 (100 = potência máxima)
 {
 	if (percentagem > 100)
 		percentagem = 100;
-	/* Placa nova com MOSFET canal-N: ativo-alto, duty direto */
-	__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, (uint32_t )percentagem * 10);
+	/* Hardware ativo-baixo: duty invertido (100% pedido -> CCR 0) */
+	__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, (uint32_t )(100 - percentagem) * 10);
 }
+
+/* Neste ambiente as temperaturas nunca são negativas: valores fora de
+   [0, TEMP_MAX_PLAUSIVEL_C] são lixo e o frame inteiro é descartado. */
+#define TEMP_MAX_PLAUSIVEL_C  150.0f
+static uint8_t TempValida(float t) {
+	return (t >= 0.0f && t <= TEMP_MAX_PLAUSIVEL_C);
+}
+
+/* Buffers crus preenchidos pela ISR. O unpack/decode/validação acontece
+   no loop principal (CAN_ProcessRx) para manter o callback curto. */
+static uint8_t inv1_rx_data[8];
+static uint8_t inv1_rx_dlc = 0;
+static volatile uint8_t inv1_rx_pending = 0;
+
+static uint8_t inv2_rx_data[8];
+static uint8_t inv2_rx_dlc = 0;
+static volatile uint8_t inv2_rx_pending = 0;
 
 /* CAN RX */
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
@@ -254,44 +275,19 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
 
 	switch (RxHeader.StdId) {
 
-	/* ---- Comando ON/OFF manual (0x23) ---- */
-	case 0x23:
-		if (RxData[5] == 0x00) {
-			Radiator_SetPWM(0);
-			WaterPump_SetPWM(0);
-			HAL_GPIO_WritePin(GPIOA, WaterPump_Pin, GPIO_PIN_SET);
-			printf("Radiator, AMS, WaterPump OFF\r\n");
-		} else if (RxData[5] == 0x01) {
-			Radiator_SetPWM(100);
-			WaterPump_SetPWM(100);
-			HAL_GPIO_WritePin(GPIOA, WaterPump_Pin, GPIO_PIN_RESET);
-			printf("Radiator, AMS, WaterPump ON\r\n");
-		}
+	/* ---- Temperaturas INV1 (0x444) ---- */
+	case DATA_T26_INV1_TEMPERATURES_FRAME_ID:
+		memcpy(inv1_rx_data, RxData, 8);
+		inv1_rx_dlc = RxHeader.DLC;
+		inv1_rx_pending = 1;
 		break;
-
-		/* ---- Temperaturas INV1 (0x444) ---- */
-	case DATA_T26_INV1_TEMPERATURES_FRAME_ID: {
-		struct data_t26_inv1_temperatures_t m;
-		if (data_t26_inv1_temperatures_unpack(&m, RxData, RxHeader.DLC) == 0) {
-			inv1_temp_inverter_c = data_t26_inv1_temperatures_inv1_temp_inverter_decode(m.inv1_temp_inverter);
-			inv1_temp_motor_c = data_t26_inv1_temperatures_inv1_temp_motor_decode(m.inv1_temp_motor);
-			inv_temps_updated = 1;
-			last_temps_tick_ms = HAL_GetTick();
-		}
-		break;
-	}
 
 		/* ---- Temperaturas INV2 (0x445) ---- */
-	case DATA_T26_INV2_TEMPERATURES_FRAME_ID: {
-		struct data_t26_inv2_temperatures_t m;
-		if (data_t26_inv2_temperatures_unpack(&m, RxData, RxHeader.DLC) == 0) {
-			inv2_temp_inverter_c = data_t26_inv2_temperatures_inv2_temp_inverter_decode(m.inv2_temp_inverter);
-			inv2_temp_motor_c = data_t26_inv2_temperatures_inv2_temp_motor_decode(m.inv2_temp_motor);
-			inv_temps_updated = 1;
-			last_temps_tick_ms = HAL_GetTick();
-		}
+	case DATA_T26_INV2_TEMPERATURES_FRAME_ID:
+		memcpy(inv2_rx_data, RxData, 8);
+		inv2_rx_dlc = RxHeader.DLC;
+		inv2_rx_pending = 1;
 		break;
-	}
 
 	default:
 		break;
@@ -369,7 +365,8 @@ int main(void) {
 		Error_Handler();
 	}
 
-	/* Garantir 0% de potência no arranque (canal-N: CCR 0 = desligado) */
+	/* Hardware ativo-baixo: CCR arranca a 0 = 100% de potência. Forçar 0%
+	   já, antes de chegar o primeiro frame de temperaturas. */
 	Radiator_SetPWM(0);
 	WaterPump_SetPWM(0);
 
@@ -408,6 +405,7 @@ int main(void) {
 		//SendData();                   // Envia dados UART e CAN
 		HeartbeatTask();              // Pisca o LED Heartbeat de forma não bloqueante
 
+		CAN_ProcessRx();      // descodifica frames de temperatura fora da ISR
 		Cooling_Update();     // interpola tabela e aplica PWM
 		PDM_SendPeriodic();   // envia 0x210 e 0x220 a cada 1s
 		Debug_Update();       // atualiza snapshot "dbg" para Live Expressions
@@ -856,6 +854,57 @@ void Cooling_LookupPWM(float temp_c, uint8_t *pump_pwm, uint8_t *fan_pwm) {
 	}
 }
 
+/* Descodifica os frames de temperatura fora da ISR. Os bytes são copiados
+   com as interrupções desligadas para não apanhar um frame a meio. */
+void CAN_ProcessRx(void) {
+	uint8_t data[8];
+	uint8_t dlc;
+
+	if (inv1_rx_pending) {
+		__disable_irq();
+		memcpy(data, inv1_rx_data, 8);
+		dlc = inv1_rx_dlc;
+		inv1_rx_pending = 0;
+		__enable_irq();
+
+		struct data_t26_inv1_temperatures_t m;
+		if (data_t26_inv1_temperatures_unpack(&m, data, dlc) == 0) {
+			float ti = data_t26_inv1_temperatures_inv1_temp_inverter_decode(m.inv1_temp_inverter);
+			float tm = data_t26_inv1_temperatures_inv1_temp_motor_decode(m.inv1_temp_motor);
+			if (TempValida(ti) && TempValida(tm)) {
+				inv1_temp_inverter_c = ti;
+				inv1_temp_motor_c = tm;
+				inv_temps_updated = 1;
+				last_temps_tick_ms = HAL_GetTick();
+			} else {
+				temp_frames_rejeitados++;
+			}
+		}
+	}
+
+	if (inv2_rx_pending) {
+		__disable_irq();
+		memcpy(data, inv2_rx_data, 8);
+		dlc = inv2_rx_dlc;
+		inv2_rx_pending = 0;
+		__enable_irq();
+
+		struct data_t26_inv2_temperatures_t m;
+		if (data_t26_inv2_temperatures_unpack(&m, data, dlc) == 0) {
+			float ti = data_t26_inv2_temperatures_inv2_temp_inverter_decode(m.inv2_temp_inverter);
+			float tm = data_t26_inv2_temperatures_inv2_temp_motor_decode(m.inv2_temp_motor);
+			if (TempValida(ti) && TempValida(tm)) {
+				inv2_temp_inverter_c = ti;
+				inv2_temp_motor_c = tm;
+				inv_temps_updated = 1;
+				last_temps_tick_ms = HAL_GetTick();
+			} else {
+				temp_frames_rejeitados++;
+			}
+		}
+	}
+}
+
 /* Corre no main loop: pega na temperatura mais alta e aplica o PWM */
 void Cooling_Update(void) {
 	if (!inv_temps_updated)
@@ -874,15 +923,30 @@ void Cooling_Update(void) {
 			cooling_active = 0;
 	}
 
-	if (cooling_active) {
-		Cooling_LookupPWM(max_temp, &pump_pwm_now, &fan_pwm_now);
-	} else {
-		pump_pwm_now = 0;
-		fan_pwm_now = 0;
-	}
+	uint8_t novo_pump = 0;
+	uint8_t novo_fan = 0;
 
-	WaterPump_SetPWM(pump_pwm_now);
-	Radiator_SetPWM(fan_pwm_now);
+	if (cooling_active)
+		Cooling_LookupPWM(max_temp, &novo_pump, &novo_fan);
+
+	/* Zona morta: com ruído no sensor a temperatura oscila alguns décimos e
+	   o PWM ficava a tremer. Só reaplica se mudar o suficiente, ou se for
+	   um extremo (0% / 100%) que tem de ser exato. */
+	int delta_pump = (int) novo_pump - (int) pump_pwm_now;
+	int delta_fan = (int) novo_fan - (int) fan_pwm_now;
+	if (delta_pump < 0)
+		delta_pump = -delta_pump;
+	if (delta_fan < 0)
+		delta_fan = -delta_fan;
+
+	if (delta_pump >= COOLING_PWM_DEADBAND || novo_pump == 0 || novo_pump == 100) {
+		pump_pwm_now = novo_pump;
+		WaterPump_SetPWM(pump_pwm_now);
+	}
+	if (delta_fan >= COOLING_PWM_DEADBAND || novo_fan == 0 || novo_fan == 100) {
+		fan_pwm_now = novo_fan;
+		Radiator_SetPWM(fan_pwm_now);
+	}
 }
 
 /* Helper genérico de TX (evita repetir o código dos mailboxes) */
@@ -921,6 +985,7 @@ void Debug_Update(void) {
 	dbg.can_tx_fail_count = can_tx_fail_count;
 	dbg.can_last_rx_id = can_last_rx_id;
 	dbg.can_rx_age_ms = HAL_GetTick() - last_rx_tick_ms;
+	dbg.temp_frames_rejeitados = temp_frames_rejeitados;
 
 	dbg.uptime_ms = HAL_GetTick();
 }

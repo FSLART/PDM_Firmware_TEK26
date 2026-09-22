@@ -47,9 +47,10 @@ typedef struct {
 	uint32_t temps_age_ms;      // há quanto tempo não chega frame de temperatura
 
 	/* LV battery / corrente */
-	float lv_voltage_v;         // tensão no pino do MCU (0-3.3V)
-	float lv_battery_voltage_v; // tensão real da bateria (após divisores)
-	uint16_t lv_voltage_raw;
+	float adc_voltage_v;          // tensão lida pelo ADC no pino do MCU (PA1)
+	float adc_battery_voltage_v;  // tensão teórica da bateria estimada pelo ADC
+	float isa_can_voltage_v;      // tensão REAL da bateria lida via CAN (ISA IDC)
+	uint16_t adc_voltage_raw;     // valor bruto do ADC (PA1)
 	float current_v;
 	uint16_t current_raw;
 
@@ -142,8 +143,9 @@ uint8_t current_idx = 0;
 uint16_t raw_voltage = 0;
 uint16_t raw_current = 0;
 
-float voltage_v = 0.0f;   // PA1 em Volts  ex: 3.009
-float lv_battery_voltage_v = 0.0f;   // Tensão real da bateria LV (voltage_v * LV_DIVIDER_RATIO)
+float adc_voltage_v = 0.0f;           // PA1 em Volts  ex: 3.009 (apenas para debug)
+float adc_battery_voltage_v = 0.0f;   // Tensão bateria pelo ADC (adc_voltage_v * LV_DIVIDER_RATIO)
+float isa_can_voltage_v = 0.0f;       // Tensão REAL da bateria recebida por CAN do ISA IDC
 float current_v = 0.0f;   // PA2 em Volts  ex: 3.530
 uint16_t current_frac = 0;
 
@@ -180,7 +182,8 @@ static void MX_TIM4_Init(void);
 /* USER CODE BEGIN PFP */
 
 void StartADC1(void);
-void VoltageMessure(uint16_t raw_voltage);
+void MeasureVoltageADC(uint16_t raw_voltage);
+void Update_LV_LED(void);
 void MeasureCurrent(uint16_t adc_value);
 void SendData(void);
 void HeartbeatTask(void);
@@ -259,6 +262,10 @@ static uint8_t inv2_rx_data[8];
 static uint8_t inv2_rx_dlc = 0;
 static volatile uint8_t inv2_rx_pending = 0;
 
+static uint8_t icd_rx_data[8];
+static uint8_t icd_rx_dlc = 0;
+static volatile uint8_t icd_rx_pending = 0;
+
 /* CAN RX */
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
 	if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK)
@@ -276,17 +283,24 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
 	switch (RxHeader.StdId) {
 
 	/* ---- Temperaturas INV1 (0x444) ---- */
-	case DATA_T26_INV1_TEMPERATURES_FRAME_ID:
+	case DATA_T26_VCU_INV1_TEMPERATURES_FRAME_ID:
 		memcpy(inv1_rx_data, RxData, 8);
 		inv1_rx_dlc = RxHeader.DLC;
 		inv1_rx_pending = 1;
 		break;
 
-		/* ---- Temperaturas INV2 (0x445) ---- */
-	case DATA_T26_INV2_TEMPERATURES_FRAME_ID:
+	/* ---- Temperaturas INV2 (0x445) ---- */
+	case DATA_T26_VCU_INV2_TEMPERATURES_FRAME_ID:
 		memcpy(inv2_rx_data, RxData, 8);
 		inv2_rx_dlc = RxHeader.DLC;
 		inv2_rx_pending = 1;
+		break;
+		
+	/* ---- ICD Result (0x502) ---- */
+	case DATA_T26_ICD_RESULT_FRAME_ID:
+		memcpy(icd_rx_data, RxData, 8);
+		icd_rx_dlc = RxHeader.DLC;
+		icd_rx_pending = 1;
 		break;
 
 	default:
@@ -400,7 +414,7 @@ int main(void) {
 	while (1) {
 
 		StartADC1();                  // Executa a leitura do ADC periodicamente
-		//VoltageMessure(raw_voltage);  // Avalia tensão e atualiza LED LV
+		//Update_LV_LED();  // Avalia tensão e atualiza LED LV
 		//MeasureCurrent(raw_current);  // Calcula e processa a corrente
 		//SendData();                   // Envia dados UART e CAN
 		HeartbeatTask();              // Pisca o LED Heartbeat de forma não bloqueante
@@ -867,10 +881,10 @@ void CAN_ProcessRx(void) {
 		inv1_rx_pending = 0;
 		__enable_irq();
 
-		struct data_t26_inv1_temperatures_t m;
-		if (data_t26_inv1_temperatures_unpack(&m, data, dlc) == 0) {
-			float ti = data_t26_inv1_temperatures_inv1_temp_inverter_decode(m.inv1_temp_inverter);
-			float tm = data_t26_inv1_temperatures_inv1_temp_motor_decode(m.inv1_temp_motor);
+		struct data_t26_vcu_inv1_temperatures_t m;
+		if (data_t26_vcu_inv1_temperatures_unpack(&m, data, dlc) == 0) {
+			float ti = data_t26_vcu_inv1_temperatures_inv1_temp_inverter_decode(m.inv1_temp_inverter);
+			float tm = data_t26_vcu_inv1_temperatures_inv1_temp_motor_decode(m.inv1_temp_motor);
 			if (TempValida(ti) && TempValida(tm)) {
 				inv1_temp_inverter_c = ti;
 				inv1_temp_motor_c = tm;
@@ -889,10 +903,10 @@ void CAN_ProcessRx(void) {
 		inv2_rx_pending = 0;
 		__enable_irq();
 
-		struct data_t26_inv2_temperatures_t m;
-		if (data_t26_inv2_temperatures_unpack(&m, data, dlc) == 0) {
-			float ti = data_t26_inv2_temperatures_inv2_temp_inverter_decode(m.inv2_temp_inverter);
-			float tm = data_t26_inv2_temperatures_inv2_temp_motor_decode(m.inv2_temp_motor);
+		struct data_t26_vcu_inv2_temperatures_t m;
+		if (data_t26_vcu_inv2_temperatures_unpack(&m, data, dlc) == 0) {
+			float ti = data_t26_vcu_inv2_temperatures_inv2_temp_inverter_decode(m.inv2_temp_inverter);
+			float tm = data_t26_vcu_inv2_temperatures_inv2_temp_motor_decode(m.inv2_temp_motor);
 			if (TempValida(ti) && TempValida(tm)) {
 				inv2_temp_inverter_c = ti;
 				inv2_temp_motor_c = tm;
@@ -901,6 +915,29 @@ void CAN_ProcessRx(void) {
 			} else {
 				temp_frames_rejeitados++;
 			}
+		}
+	}
+
+	if (icd_rx_pending) {
+		__disable_irq();
+		memcpy(data, icd_rx_data, 8);
+		dlc = icd_rx_dlc;
+		icd_rx_pending = 0;
+		__enable_irq();
+
+		struct data_t26_icd_result_t m;
+		if (data_t26_icd_result_unpack(&m, data, dlc) == 0) {
+			// A tensão ubat do ISA ICD costuma vir em mV, mas o decode devolve double.
+			// O PDM assume tensão em Volts.
+			isa_can_voltage_v = (float) data_t26_icd_result_icd_ubat_decode(m.icd_ubat);
+			// Se o decode for mV, converte para V (verificar escala):
+			// Se o decode já estiver em V, remover a divisão. 
+			// Geralmente os decodes de DBC retornam valores na unidade física final,
+			// mas vamos deixar como float e usar diretamente.
+			// Se na dbc for V, isa_can_voltage_v está correto.
+			// Se na dbc for mV e o decode não aplicar factor, teríamos de dividir por 1000.
+			// Vou assumir que o decode() aplica a conversão da DBC e dá Volts (ou mV dependendo).
+			// Vou usar em Volts.
 		}
 	}
 }
@@ -972,9 +1009,10 @@ void Debug_Update(void) {
 	dbg.inv2_motor_temp_c = inv2_temp_motor_c;
 	dbg.temps_age_ms = HAL_GetTick() - last_temps_tick_ms;
 
-	dbg.lv_voltage_v = voltage_v;
-	dbg.lv_battery_voltage_v = lv_battery_voltage_v;
-	dbg.lv_voltage_raw = raw_voltage;
+	dbg.adc_voltage_v = adc_voltage_v;
+	dbg.adc_battery_voltage_v = adc_battery_voltage_v;
+	dbg.isa_can_voltage_v = isa_can_voltage_v;
+	dbg.adc_voltage_raw = raw_voltage;
 	dbg.current_v = current_v;
 	dbg.current_raw = raw_current;
 
@@ -1000,7 +1038,7 @@ void PDM_SendPeriodic(void) {
 
 	/* PDM_LV (0x210) - tensão real da bateria LV (não a tensão no pino do MCU) */
 	struct data_t26_pdm_lv_t lv_msg;
-	lv_msg.lv_voltage_m_v = data_t26_pdm_lv_lv_voltage_m_v_encode(lv_battery_voltage_v); // V -> mV
+	lv_msg.lv_voltage_m_v = data_t26_pdm_lv_lv_voltage_m_v_encode(isa_can_voltage_v); // V -> mV
 	data_t26_pdm_lv_pack(buf, &lv_msg, sizeof(buf));
 	CAN_Send(DATA_T26_PDM_LV_FRAME_ID, buf, DATA_T26_PDM_LV_LENGTH);
 
@@ -1040,28 +1078,32 @@ void StartADC1(void) {
 		current_idx = (current_idx + 1) % BUFFER_SIZE;
 		raw_current = current_sum / BUFFER_SIZE;
 
-		VoltageMessure(raw_voltage);
+		MeasureVoltageADC(raw_voltage);
+		Update_LV_LED();
 		MeasureCurrent(raw_current);
 	}
 }
 
-void VoltageMessure(uint16_t adc_voltage) {
-	// Converte o valor raw do ADC para Volts
-	voltage_v = (float) adc_voltage * 3.3f / 4095.0f;
+void MeasureVoltageADC(uint16_t adc_value) {
+	// Apenas para debug/monitorização, já não é usado no controlo
+	adc_voltage_v = (float) adc_value * 3.3f / 4095.0f;
+	adc_battery_voltage_v = adc_voltage_v * LV_DIVIDER_RATIO;
+}
 
-	// Desfaz os dois divisores resistivos -> tensão real da bateria LV
-	lv_battery_voltage_v = voltage_v * LV_DIVIDER_RATIO;
+void Update_LV_LED(void) {
+	// A tensão real da bateria (isa_can_voltage_v) agora é atualizada
+	// pela mensagem CAN do ISA ICD (ver CAN_ProcessRx).
 
 	static uint8_t lv_state = 0;
 
 	/* --- LÓGICA DE ESTADOS (tensão real da bateria, não a do pino) --- */
-	if (lv_battery_voltage_v >= LV_VOLT_HIGH_V) {
+	if (isa_can_voltage_v >= LV_VOLT_HIGH_V) {
 		// >= 26V -> estático ligado
 		lv_state = 3;
-	} else if (lv_battery_voltage_v >= LV_VOLT_MID_V) {
+	} else if (isa_can_voltage_v >= LV_VOLT_MID_V) {
 		// 25-26V -> pisca lento
 		lv_state = 2;
-	} else if (lv_battery_voltage_v >= LV_VOLT_LOW_V) {
+	} else if (isa_can_voltage_v >= LV_VOLT_LOW_V) {
 		// 22-25V -> pisca rápido
 		lv_state = 1;
 	} else {
@@ -1106,11 +1148,11 @@ void SendData(void) {
 		data_trigger = 0;
 
 		// UART — imprime float diretamente
-		printf("PA1: %.3f V | PA2: %.3f V\r\n", voltage_v, current_v);
+		printf("LV_BAT (CAN): %.3f V | PA2 (Cur): %.3f V\r\n", isa_can_voltage_v, current_v);
 
 		// CAN — envia como inteiro x1000 (ex: 3.009V → 3009)
 		// Assim preservas 3 casas decimais sem float no CAN
-		uint16_t can_voltage = (uint16_t) (voltage_v * 1000.0f);  // ex: 3009
+		uint16_t can_voltage = (uint16_t) (isa_can_voltage_v * 1000.0f);  // ex: 3009
 		uint16_t can_current = (uint16_t) (current_v * 1000.0f);  // ex: 3530
 
 		TxData[0] = (can_voltage >> 8) & 0xFF;  // High byte
@@ -1155,8 +1197,7 @@ void Error_Handler(void) {
 	/* User can add his own implementation to report the HAL error return state */
 	__disable_irq();
 	while (1) {
-	}
-	/* USER CODE END Error_Handler_Debug */
+	}	/* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef  USE_FULL_ASSERT

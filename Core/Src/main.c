@@ -94,7 +94,7 @@ typedef struct {
 #define COOLING_TEMP_MAX_C     65.0f   // At or above this -> 100% PWM
 #define COOLING_HYSTERESIS_C   5.0f    // Só desliga abaixo de (MIN - isto)
 #define COOLING_PWM_DEADBAND   3       // Só reaplica PWM se mudar >= isto (%)
-#define COOLING_TABLE_SIZE     2
+#define COOLING_TABLE_SIZE     3
 
 /* --- Periodic CAN TX --- */
 #define TIM3_TICK_MS           100     // TIM3 interrupt period (72MHz/1001/7201 ~ 100ms)
@@ -206,8 +206,10 @@ typedef struct {
 
 static const cooling_point_t cooling_table[COOLING_TABLE_SIZE] = {
 /* temp   pump  fan  */
-{ 40.0f, 0, 0 }, { 65.0f, 100, 100 }, // linear entre COOLING_TEMP_MIN_C e COOLING_TEMP_MAX_C
-		};
+{ 40.0f, 40, 30 }, // Arranca logo a 40% (bomba) e 30% (ventoinha) para evitar stall
+{ 55.0f, 80, 70 }, // Ponto intermédio
+{ 65.0f, 100, 100 } // Máximo
+};
 
 /* Últimas temperaturas recebidas dos inversores (ºC) */
 float inv1_temp_inverter_c = 0.0f;
@@ -217,8 +219,8 @@ float inv2_temp_motor_c = 0.0f;
 volatile uint8_t inv_temps_updated = 0;
 
 /* PWM atualmente aplicado (também vai no CAN PDM_Cooling) */
-uint8_t pump_pwm_now = 0;
-uint8_t fan_pwm_now = 0;
+uint8_t pump_pwm_now = 100;
+uint8_t fan_pwm_now = 100;
 uint8_t cooling_active = 0;   // estado da histerese (ver Cooling_Update)
 
 uint16_t pdm_tx_counter = 0;   // incrementado pelo TIM3, dispara TX a 1s
@@ -381,8 +383,8 @@ int main(void) {
 
 	/* Hardware ativo-baixo: CCR arranca a 0 = 100% de potência. Forçar 0%
 	   já, antes de chegar o primeiro frame de temperaturas. */
-	Radiator_SetPWM(0);
-	WaterPump_SetPWM(0);
+	Radiator_SetPWM(100);
+	WaterPump_SetPWM(100);
 
 	/* CAN */
 	HAL_CAN_Start(&hcan);
@@ -401,7 +403,7 @@ int main(void) {
 
 	// Start IO OFF
 	HAL_GPIO_WritePin(GPIOB, Radiator_Pin, GPIO_PIN_SET); // Invert Logic 1 -> 0
-	HAL_GPIO_WritePin(GPIOB, AMS_Pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(GPIOB, AMS_Pin, GPIO_PIN_RESET); // Começa em estado de erro (Nível BAIXO = ventoinhas ON)
 	HAL_GPIO_WritePin(GPIOA, WaterPump_Pin, GPIO_PIN_SET);
 
 	/* Inicializar o LED LV desligado */
@@ -805,7 +807,7 @@ static void MX_GPIO_Init(void) {
 	HAL_GPIO_WritePin(Led_LV_GPIO_Port, Led_LV_Pin, GPIO_PIN_RESET);
 
 	/*Configure GPIO pin Output Level */
-	HAL_GPIO_WritePin(AMS_GPIO_Port, AMS_Pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(AMS_GPIO_Port, AMS_Pin, GPIO_PIN_RESET);
 
 	/*Configure GPIO pins : LED_Hearthbeat_Pin Led_Debug_P14_Pin Led_Debug_P15_Pin */
 	GPIO_InitStruct.Pin = LED_Hearthbeat_Pin | Led_Debug_P14_Pin | Led_Debug_P15_Pin;
@@ -948,6 +950,13 @@ void Cooling_Update(void) {
 		return;
 	inv_temps_updated = 0;
 
+	static uint8_t system_in_error = 1;
+	if (system_in_error) {
+		system_in_error = 0;
+		// Sai do estado de erro (fail-safe): liberta o controlo das ventoinhas da bateria (Nível ALTO = OFF)
+		HAL_GPIO_WritePin(GPIOB, AMS_Pin, GPIO_PIN_SET);
+	}
+
 	float max_temp = MaxOf4(inv1_temp_inverter_c, inv1_temp_motor_c, inv2_temp_inverter_c, inv2_temp_motor_c);
 
 	/* Histerese: liga ao atingir COOLING_TEMP_MIN_C, só desliga abaixo de
@@ -965,6 +974,10 @@ void Cooling_Update(void) {
 
 	if (cooling_active)
 		Cooling_LookupPWM(max_temp, &novo_pump, &novo_fan);
+
+	// TEMPORÁRIO: Forçar bomba a 40% para sangrar o circuito de água
+	// Descomentar ou alterar aqui conforme necessário.
+	//novo_pump = 40;
 
 	/* Zona morta: com ruído no sensor a temperatura oscila alguns décimos e
 	   o PWM ficava a tremer. Só reaplica se mudar o suficiente, ou se for

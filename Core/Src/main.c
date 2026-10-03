@@ -951,22 +951,27 @@ void Cooling_Update(void) {
 	inv_temps_updated = 0;
 
 	static uint8_t system_in_error = 1;
-	if (system_in_error) {
-		system_in_error = 0;
-		// Sai do estado de erro (fail-safe): liberta o controlo das ventoinhas da bateria (Nível ALTO = OFF)
-		HAL_GPIO_WritePin(GPIOB, AMS_Pin, GPIO_PIN_SET);
-	}
 
 	float max_temp = MaxOf4(inv1_temp_inverter_c, inv1_temp_motor_c, inv2_temp_inverter_c, inv2_temp_motor_c);
 
 	/* Histerese: liga ao atingir COOLING_TEMP_MIN_C, só desliga abaixo de
 	 (COOLING_TEMP_MIN_C - COOLING_HYSTERESIS_C) - evita oscilar à volta do limiar */
 	if (!cooling_active) {
-		if (max_temp >= COOLING_TEMP_MIN_C)
+		if (max_temp >= COOLING_TEMP_MIN_C) {
 			cooling_active = 1;
+			HAL_GPIO_WritePin(GPIOB, AMS_Pin, GPIO_PIN_RESET); // Ventoinhas AMS ON
+		} else if (system_in_error) {
+			HAL_GPIO_WritePin(GPIOB, AMS_Pin, GPIO_PIN_SET);   // Ventoinhas AMS OFF
+		}
 	} else {
-		if (max_temp < (COOLING_TEMP_MIN_C - COOLING_HYSTERESIS_C))
+		if (max_temp < (COOLING_TEMP_MIN_C - COOLING_HYSTERESIS_C)) {
 			cooling_active = 0;
+			HAL_GPIO_WritePin(GPIOB, AMS_Pin, GPIO_PIN_SET);   // Ventoinhas AMS OFF
+		}
+	}
+
+	if (system_in_error) {
+		system_in_error = 0;
 	}
 
 	uint8_t novo_pump = 0;
@@ -977,7 +982,7 @@ void Cooling_Update(void) {
 
 	// TEMPORÁRIO: Forçar bomba a 40% para sangrar o circuito de água
 	// Descomentar ou alterar aqui conforme necessário.
-	//novo_pump = 40;
+	//novo_pump = 30;
 
 	/* Zona morta: com ruído no sensor a temperatura oscila alguns décimos e
 	   o PWM ficava a tremer. Só reaplica se mudar o suficiente, ou se for
